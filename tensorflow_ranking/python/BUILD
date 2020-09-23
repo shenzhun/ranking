@@ -1,7 +1,5 @@
 # Description:
 # TensorFlow Ranking, the project to build ranking models on TensorFlow.
-# Placeholder for internal Python version compatibility macro.
-
 package(
     default_visibility = [
         "//tensorflow_ranking:__subpackages__",
@@ -25,6 +23,7 @@ py_library(
         ":losses",
         ":metrics",
         ":model",
+        "//tensorflow_ranking/python/keras",
     ],
 )
 
@@ -40,6 +39,7 @@ py_library(
     srcs_version = "PY2AND3",
     deps = [
         ":utils",
+        # py/six dep,
         # py/tensorflow dep,
     ],
 )
@@ -59,7 +59,8 @@ py_test(
     name = "metrics_test",
     size = "medium",
     srcs = ["metrics_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -84,7 +85,8 @@ py_test(
     name = "utils_test",
     size = "medium",
     srcs = ["utils_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -120,7 +122,8 @@ py_test(
     name = "losses_test",
     size = "medium",
     srcs = ["losses_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -145,7 +148,8 @@ py_test(
     name = "head_test",
     size = "medium",
     srcs = ["head_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -171,6 +175,8 @@ py_library(
 py_test(
     name = "data_test",
     srcs = ["data_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -197,6 +203,8 @@ py_test(
     name = "feature_test",
     size = "small",
     srcs = ["feature_test.py"],
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -223,7 +231,8 @@ py_test(
     name = "model_test",
     size = "medium",
     srcs = ["model_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
@@ -254,16 +263,18 @@ py_library(
 
 py_test(
     name = "estimator_test",
-    size = "medium",
+    size = "large",
     srcs = ["estimator_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
     ],
     deps = [
+        ":data",
         ":estimator",
         ":feature",
-        # py/tensorflow dep,
+        # tensorflow_serving/apis:input_proto_py_pb2 dep,
     ],
 )

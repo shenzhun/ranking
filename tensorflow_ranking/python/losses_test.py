@@ -29,6 +29,52 @@ def ln(x):
   return math.log(x)
 
 
+class UtilsTest(tf.test.TestCase):
+
+  def test_approx_ranks(self):
+    with tf.Graph().as_default():
+      logits = [[1., 3., 2., 0.], [4., 2., 1.5, 3.]]
+      target_ranks = [[3., 1., 2., 4.], [1., 3., 4., 2.]]
+
+      approx_ranks = losses_impl.approx_ranks(logits, 0.01)
+      with tf.compat.v1.Session() as sess:
+        approx_ranks = sess.run(approx_ranks)
+        self.assertAllClose(approx_ranks, target_ranks)
+
+  def test_inverse_max_dcg(self):
+    with tf.Graph().as_default():
+      labels = [[1., 4., 1., 0.], [4., 2., 0., 3.], [0., 0., 0., 0.]]
+      target = [[0.04297], [0.033139], [0.]]
+      target_1 = [[0.04621], [0.04621], [0.]]
+
+      inverse_max_dcg = losses_impl.inverse_max_dcg(labels)
+      inverse_max_dcg_1 = losses_impl.inverse_max_dcg(labels, topn=1)
+      with tf.compat.v1.Session() as sess:
+        inverse_max_dcg = sess.run(inverse_max_dcg)
+        self.assertAllClose(inverse_max_dcg, target)
+        inverse_max_dcg_1 = sess.run(inverse_max_dcg_1)
+        self.assertAllClose(inverse_max_dcg_1, target_1)
+
+  def test_ndcg(self):
+    with tf.Graph().as_default():
+      labels = [[1., 4., 1., 0.], [4., 2., 0., 3.], [0., 0., 0., 0.]]
+      ranks = [[1, 2, 3, 4], [1, 3, 4, 2], [1, 2, 3, 4]]
+      perm_mat = [[[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+                  [[1, 0, 0, 0], [0, 0, 0, 1], [0, 1, 0, 0], [0, 0, 1, 0]],
+                  [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]]
+      ndcg_ = [[0.679685], [0.95176], [0.]]
+      ndcg_rank = [[0.679685], [1.], [0.]]
+      ndcg_perm = [[0.679685], [1.], [0.]]
+
+      with tf.compat.v1.Session() as sess:
+        ndcg = sess.run(losses_impl.ndcg(labels))
+        self.assertAllClose(ndcg, ndcg_)
+        ndcg = sess.run(losses_impl.ndcg(labels, ranks))
+        self.assertAllClose(ndcg, ndcg_rank)
+        ndcg = sess.run(losses_impl.ndcg(labels, perm_mat=perm_mat))
+        self.assertAllClose(ndcg, ndcg_perm)
+
+
 class DCGLambdaWeightTest(tf.test.TestCase):
   """Test cases for DCGLambdaWeight."""
 
@@ -594,6 +640,64 @@ class LossesTest(tf.test.TestCase):
             loss_fn_1(labels, scores, features).eval(),
             loss_fn_2(labels, scores, features).eval())
 
+  def test_unique_softmax_loss(self):
+    with tf.Graph().as_default():
+      scores = [[1., 3., 2.], [1., 2., 3.], [1., 2., 3.]]
+      labels = [[0., 0., 1.], [0., 1., 2.], [0., 0., 0.]]
+      weights = [[2.], [1.], [1.]]
+      with self.cached_session():
+        self.assertAlmostEqual(
+            ranking_losses._unique_softmax_loss(labels, scores).eval(),
+            -(math.log(_softmax(scores[0])[2]) +
+              math.log(_softmax(scores[1][:2])[1]) +
+              math.log(_softmax(scores[1])[2]) * 3.) / 3.,
+            places=5)
+        self.assertAlmostEqual(
+            ranking_losses._unique_softmax_loss(labels, scores, weights).eval(),
+            -(math.log(_softmax(scores[0])[2]) * 2. +
+              math.log(_softmax(scores[1][:2])[1]) * 1. +
+              math.log(_softmax(scores[1])[2]) * 3. * 1.) / 3.,
+            places=5)
+
+  def test_make_unique_softmax_loss_fn(self):
+    with tf.Graph().as_default():
+      scores = [[1., 3., 2.], [1., 2., 3.]]
+      labels = [[0., 0., 1.], [0., 1., 2.]]
+      weights = [[2.], [1.]]
+      weights_feature_name = 'weights'
+      features = {weights_feature_name: weights}
+      with self.cached_session():
+        loss_fn_simple = ranking_losses.make_loss_fn(
+            ranking_losses.RankingLossKey.UNIQUE_SOFTMAX_LOSS)
+        self.assertAlmostEqual(
+            loss_fn_simple(labels, scores, features).eval(),
+            -(math.log(_softmax(scores[0])[2]) +
+              math.log(_softmax(scores[1][:2])[1]) +
+              math.log(_softmax(scores[1])[2]) * 3.) / 3.,
+            places=5)
+
+        loss_fn_weighted = ranking_losses.make_loss_fn(
+            ranking_losses.RankingLossKey.UNIQUE_SOFTMAX_LOSS,
+            weights_feature_name=weights_feature_name)
+        self.assertAlmostEqual(
+            loss_fn_weighted(labels, scores, features).eval(),
+            -(math.log(_softmax(scores[0])[2]) * 2. +
+              math.log(_softmax(scores[1][:2])[1]) * 1. +
+              math.log(_softmax(scores[1])[2]) * 3. * 1.) / 3.,
+            places=5)
+
+        # Test loss reduction method.
+        # Two reduction methods should return different loss values.
+        loss_fn_1 = ranking_losses.make_loss_fn(
+            ranking_losses.RankingLossKey.UNIQUE_SOFTMAX_LOSS,
+            reduction=tf.compat.v1.losses.Reduction.SUM)
+        loss_fn_2 = ranking_losses.make_loss_fn(
+            ranking_losses.RankingLossKey.UNIQUE_SOFTMAX_LOSS,
+            reduction=tf.compat.v1.losses.Reduction.MEAN)
+        self.assertNotAlmostEqual(
+            loss_fn_1(labels, scores, features).eval(),
+            loss_fn_2(labels, scores, features).eval())
+
   def test_sigmoid_cross_entropy_loss(self):
     with tf.Graph().as_default():
       scores = [[0.2, 0.5, 0.3], [0.2, 0.3, 0.5], [0.2, 0.3, 0.5]]
@@ -790,33 +894,33 @@ class LossesTest(tf.test.TestCase):
   def test_approx_ndcg_loss(self):
     with tf.Graph().as_default():
       scores = [[1.4, -2.8, -0.4], [0., 1.8, 10.2], [1., 1.2, -3.2]]
-      # ranks= [[1,    3,    2],   [3,  2,   1],    [2,  1,    3]]
-      labels = [[0., 2., 1.], [1., 0., 3.], [0., 0., 0.]]
+      # ranks= [[1,    3,    2],   [2,  1,   3],    [2,  1,    3]]
+      labels = [[0., 2., 1.], [1., 0., -1.], [0., 0., 0.]]
       weights = [[2.], [1.], [1.]]
       example_weights = [[1., 2., 3.], [4., 5., 6.], [7., 8., 9.]]
-      norm_wts = [
-          sum([wt * l
-               for wt, l in zip(wts, lbls)]) / sum(lbls) if sum(lbls) else 0
-          for wts, lbls in zip(example_weights, labels)
-      ]
+      norm_weights = []
+      for weight, label in zip(example_weights, labels):
+        sum_label = sum(max(0, l) for l in label)
+        norm_weights.append(
+            sum(w * max(0, l) for w, l in zip(weight, label)) /
+            sum_label if sum_label else 0)
 
       with self.cached_session():
         self.assertAlmostEqual(
             ranking_losses._approx_ndcg_loss(labels, scores).eval(),
-            -((1 / (3 / ln(2) + 1 / ln(3))) * (3 / ln(4) + 1 / ln(3)) +
-              (1 / (7 / ln(2) + 1 / ln(3))) * (7 / ln(2) + 1 / ln(4))),
+            -((1 / (3 / ln(2) + 1 / ln(3))) * (3 / ln(4) + 1 / ln(3)) + ln(2) *
+              (1 / ln(3))),
             places=5)
         self.assertAlmostEqual(
             ranking_losses._approx_ndcg_loss(labels, scores, weights).eval(),
-            -(2 * (1 / (3 / ln(2) + 1 / ln(3))) * (3 / ln(4) + 1 / ln(3)) + 1 *
-              (1 / (7 / ln(2) + 1 / ln(3))) * (7 / ln(2) + 1 / ln(4))),
+            -(2 * (1 / (3 / ln(2) + 1 / ln(3))) *
+              (3 / ln(4) + 1 / ln(3)) + 1 * ln(2) * (1 / ln(3))),
             places=5)
         self.assertAlmostEqual(
             ranking_losses._approx_ndcg_loss(labels, scores,
                                              example_weights).eval(),
-            -(norm_wts[0] * (1 / (3 / ln(2) + 1 / ln(3))) *
-              (3 / ln(4) + 1 / ln(3)) + norm_wts[1] *
-              (1 / (7 / ln(2) + 1 / ln(3))) * (7 / ln(2) + 1 / ln(4))),
+            -(norm_weights[0] * (1 / (3 / ln(2) + 1 / ln(3))) *
+              (3 / ln(4) + 1 / ln(3)) + norm_weights[1] * ln(2) * (1 / ln(3))),
             places=5)
 
   def test_make_approx_ndcg_fn(self):
@@ -846,13 +950,13 @@ class LossesTest(tf.test.TestCase):
               (1 / (7 / ln(2) + 1 / ln(3))) * (7 / ln(2) + 1 / ln(4))),
             places=5)
 
-        # Test different alphas.
+        # Test different temperature.
         loss_fn_1 = ranking_losses.make_loss_fn(
             ranking_losses.RankingLossKey.APPROX_NDCG_LOSS,
-            extra_args={'alpha': 0.1})
+            params={'temperature': 10})
         loss_fn_2 = ranking_losses.make_loss_fn(
             ranking_losses.RankingLossKey.APPROX_NDCG_LOSS,
-            extra_args={'alpha': 100.})
+            params={'temperature': 0.01})
         self.assertNotAlmostEqual(
             loss_fn_1(labels, scores, features).eval(),
             loss_fn_2(labels, scores, features).eval())
@@ -868,6 +972,56 @@ class LossesTest(tf.test.TestCase):
         self.assertNotAlmostEqual(
             loss_fn_1(labels, scores, features).eval(),
             loss_fn_2(labels, scores, features).eval())
+
+  def test_make_gumbel_approx_ndcg_fn(self):
+    with tf.Graph().as_default():
+      scores = [[1.4, -2.8, -0.4], [0., 1.8, 10.2], [1., 1.2, -3.2]]
+      labels = [[0., 2., 1.], [1., 0., 3.], [1., 0., 0.]]
+      weights = [[2.], [1.], [1.]]
+      # sampled_scores = [[-.291, -1.643, -2.826],
+      #                   [-.0866, -2.924, -3.530],
+      #                   [-12.42, -9.492, -7.939e-5],
+      #                   [-8.859, -6.830, -1.223e-3],
+      #                   [-.8930, -.5266, -45.80183],
+      #                   [-.6650, -.7220, -45.94149]]
+      # sampled_rank = [[1, 2, 3],
+      #                 [1, 2, 3],
+      #                 [3, 2, 1],
+      #                 [3, 2, 1],
+      #                 [2, 1, 3],
+      #                 [1, 2, 3]]
+      # expanded_labels = [[0., 2., 1.], [0., 2., 1.],
+      #                    [1., 0., 3.], [1., 0., 3.],
+      #                    [1., 0., 0.], [1., 0., 0.]]
+      # expanded_weights = [[2.], [2.], [1.], [1.], [1.], [1.]]
+
+      weights_feature_name = 'weights'
+      features = {weights_feature_name: weights}
+      with self.cached_session():
+        loss_fn_simple = ranking_losses.make_loss_fn(
+            ranking_losses.RankingLossKey.GUMBEL_APPROX_NDCG_LOSS,
+            reduction=tf.compat.v1.losses.Reduction.SUM,
+            params={'temperature': 0.01},
+            gumbel_params={'sample_size': 2, 'seed': 1})
+        self.assertAlmostEqual(
+            loss_fn_simple(labels, scores, features).eval(),
+            -((2 / (3 / ln(2) + 1 / ln(3))) * (3 / ln(3) + 1 / ln(4)) +
+              (2 / (7 / ln(2) + 1 / ln(3))) * (7 / ln(2) + 1 / ln(4)) +
+              (1 / (1 / ln(2))) * (1 / ln(3)) + 1),
+            places=5)
+
+        loss_fn_weighted = ranking_losses.make_loss_fn(
+            ranking_losses.RankingLossKey.GUMBEL_APPROX_NDCG_LOSS,
+            weights_feature_name=weights_feature_name,
+            reduction=tf.compat.v1.losses.Reduction.SUM,
+            params={'temperature': 0.01},
+            gumbel_params={'sample_size': 2, 'seed': 1})
+        self.assertAlmostEqual(
+            loss_fn_weighted(labels, scores, features).eval(),
+            -(2 * (2 / (3 / ln(2) + 1 / ln(3))) * (3 / ln(3) + 1 / ln(4)) +
+              1 * (2 / (7 / ln(2) + 1 / ln(3))) * (7 / ln(2) + 1 / ln(4)) +
+              1 * (1 / (1 / ln(2))) * (1 / ln(3)) + 1 * 1),
+            places=5)
 
   def test_approx_mrr_loss(self):
     with tf.Graph().as_default():
@@ -910,13 +1064,13 @@ class LossesTest(tf.test.TestCase):
             -(2 * 1 / 2. + 1 * 1 / 2. * (1 / 3. + 1 / 1.)),
             places=5)
 
-        # Test different alphas.
+        # Test different temperatures.
         loss_fn_1 = ranking_losses.make_loss_fn(
             ranking_losses.RankingLossKey.APPROX_MRR_LOSS,
-            extra_args={'alpha': 0.1})
+            params={'temperature': 10})
         loss_fn_2 = ranking_losses.make_loss_fn(
             ranking_losses.RankingLossKey.APPROX_MRR_LOSS,
-            extra_args={'alpha': 100.})
+            params={'temperature': 0.01})
         self.assertNotAlmostEqual(
             loss_fn_1(labels, scores, features).eval(),
             loss_fn_2(labels, scores, features).eval())
@@ -1140,39 +1294,42 @@ class LossesTest(tf.test.TestCase):
 
   def test_gumbel_softmax_sample(self):
     with tf.Graph().as_default():
-      scores = [[1.4, -2.8, -0.4],
-                [0., 1.8, 10.2],
-                [1., 1.2, -3.2]]
-      labels = [[0., 0., 1.],
-                [1., 0., 1.],
-                [0., 0., -1.]]
-      weights = [[2.],
-                 [1.],
-                 [1.]]
+      scores = [[1.4, -2.8, -0.4], [0., 1.8, 10.2], [1., 1.2, -3.2]]
+      labels = [[0., 0., 1.], [1., 0., 1.], [0., 0., -1.]]
+      labels_3d = [[[0., 0.], [0., 1.], [1., 0.]], [[1., 1.], [0., 0.],
+                                                    [0., 1.]],
+                   [[0., 0.], [0., 0.], [-1., -1.]]]
+      weights = [[2.], [1.], [1.]]
 
-      sampled_scores = [[-.291, -1.643, -2.826],
-                        [-.0866, -2.924, -3.530],
-                        [-12.42, -9.492, -7.939e-5],
-                        [-8.859, -6.830, -1.223e-3],
+      sampled_scores = [[-.291, -1.643, -2.826], [-.0866, -2.924, -3.530],
+                        [-12.42, -9.492,
+                         -7.939e-5], [-8.859, -6.830, -1.223e-3],
                         [-.8930, -.5266, -45.80183],
                         [-.6650, -.7220, -45.94149]]
 
-      expanded_labels = [[0., 0., 1.],
-                         [0., 0., 1.],
-                         [1., 0., 1.],
-                         [1., 0., 1.],
-                         [0., 0., -1.],
-                         [0., 0., -1.]]
-      expanded_weights = [[2.], [2.],
-                          [1.], [1.],
-                          [1.], [1.]]
+      expanded_labels = [[0., 0., 1.], [0., 0., 1.], [1., 0., 1.], [1., 0., 1.],
+                         [0., 0., -1.], [0., 0., -1.]]
 
+      expanded_labels_3d = [[[0., 0.], [0., 1.], [1., 0.]],
+                            [[0., 0.], [0., 1.], [1., 0.]],
+                            [[1., 1.], [0., 0.], [0., 1.]],
+                            [[1., 1.], [0., 0.], [0., 1.]],
+                            [[0., 0.], [0., 0.], [-1., -1.]],
+                            [[0., 0.], [0., 0.], [-1., -1.]]]
+
+      expanded_weights = [[2.], [2.], [1.], [1.], [1.], [1.]]
+
+      gumbel_sampler = losses_impl.GumbelSampler(sample_size=2, seed=1)
       with self.cached_session():
-        gbl_labels, gbl_scores, gbl_weights = losses_impl.gumbel_softmax_sample(
-            labels, scores, weights, sample_size=2, seed=1)
+        gbl_labels, gbl_scores, gbl_weights = gumbel_sampler.sample(
+            labels, scores, weights)
         self.assertAllEqual(gbl_labels.eval(), expanded_labels)
         self.assertAllClose(gbl_scores.eval(), sampled_scores, rtol=1e-3)
         self.assertAllEqual(gbl_weights.eval(), expanded_weights)
+        gbl_labels_3d, gbl_scores, _ = gumbel_sampler.sample(
+            labels_3d, scores, weights)
+        self.assertAllEqual(gbl_labels_3d.eval(), expanded_labels_3d)
+        self.assertAllClose(gbl_scores.eval(), sampled_scores, rtol=1e-3)
 
   def test_neural_sort(self):
     with tf.Graph().as_default():

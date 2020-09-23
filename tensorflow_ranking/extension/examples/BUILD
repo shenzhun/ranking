@@ -1,6 +1,5 @@
 # Description:
 # Example usage of tensorflow ranking extensions.
-# Placeholder for internal Python version compatibility macro.
 
 package(
     default_visibility = [
@@ -39,13 +38,53 @@ py_test(
     name = "pipeline_example_test",
     size = "large",
     srcs = ["pipeline_example_test.py"],
-    srcs_version = "PY2AND3",
+    python_version = "PY3",
+    srcs_version = "PY3",
     tags = [
         "no_pip",
         "notsan",
     ],
     deps = [
         ":pipeline_example_lib",
+        # py/absl/flags dep,
+        # py/absl/testing:flagsaver dep,
+        # py/tensorflow dep,
+        # tensorflow_serving/apis:input_proto_py_pb2 dep,
+    ],
+)
+
+py_library(
+    name = "tfrbert_example_lib",
+    srcs = ["tfrbert_example.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        # py/absl/flags dep,
+        # py/tensorflow dep,
+        "//tensorflow_ranking",
+        "//tensorflow_ranking/extension:tfrbert",
+    ],
+)
+
+py_binary(
+    name = "tfrbert_example_py_binary",
+    srcs = ["tfrbert_example.py"],
+    main = "tfrbert_example.py",
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
+    deps = [
+        ":tfrbert_example_lib",
+    ],
+)
+
+py_test(
+    name = "tfrbert_example_test",
+    size = "large",
+    srcs = ["tfrbert_example_test.py"],
+    data = ["//tensorflow_ranking/extension:testdata"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
+    deps = [
+        ":tfrbert_example_lib",
         # py/absl/flags dep,
         # py/absl/testing:flagsaver dep,
         # py/tensorflow dep,

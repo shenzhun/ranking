@@ -14,29 +14,67 @@
     <img src="https://www.tensorflow.org/images/GitHub-Mark-32px.png" />
     View source on GitHub
   </a>
-</td></table>
+</td>
+</table>
 
 Returns dense tensors from features using feature columns.
 
-```python
-tfr.feature.encode_features(
+<pre class="devsite-click-to-copy prettyprint lang-py tfo-signature-link">
+<code>tfr.feature.encode_features(
     features, feature_columns, mode=tf.estimator.ModeKeys.TRAIN, scope=None
 )
-```
+</code></pre>
 
 <!-- Placeholder for "Used in" -->
 
 This function encodes the feature column transformation on the 'raw' `features`.
 
-#### Args:
+<!-- Tabular view -->
+ <table class="responsive fixed orange">
+<colgroup><col width="214px"><col></colgroup>
+<tr><th colspan="2"><h2 class="add-link">Args</h2></th></tr>
 
-*   <b>`features`</b>: (dict) mapping feature names to feature values, possibly
-    obtained from input_fn.
-*   <b>`feature_columns`</b>: (list) list of feature columns.
-*   <b>`mode`</b>: (`estimator.ModeKeys`) Specifies if this is training,
-    evaluation or inference. See `ModeKeys`.
-*   <b>`scope`</b>: (str) variable scope for the per column input layers.
+<tr>
+<td>
+`features`
+</td>
+<td>
+(dict) mapping feature names to feature values, possibly obtained
+from input_fn.
+</td>
+</tr><tr>
+<td>
+`feature_columns`
+</td>
+<td>
+(list)  list of feature columns.
+</td>
+</tr><tr>
+<td>
+`mode`
+</td>
+<td>
+(`estimator.ModeKeys`) Specifies if this is training, evaluation or
+inference. See `ModeKeys`.
+</td>
+</tr><tr>
+<td>
+`scope`
+</td>
+<td>
+(str) variable scope for the per column input layers.
+</td>
+</tr>
+</table>
 
-#### Returns:
-
+<!-- Tabular view -->
+ <table class="responsive fixed orange">
+<colgroup><col width="214px"><col></colgroup>
+<tr><th colspan="2"><h2 class="add-link">Returns</h2></th></tr>
+<tr class="alt">
+<td colspan="2">
 (dict) A mapping from columns to dense tensors.
+</td>
+</tr>
+
+</table>

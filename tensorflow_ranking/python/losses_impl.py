@@ -56,6 +56,100 @@ def _get_valid_pairs_and_clean_labels(labels):
   return valid_pairs, labels
 
 
+def approx_ranks(logits, temperature=0.1):
+  r"""Computes approximate ranks given a list of logits.
+
+  Given a list of logits, the rank of an item in the list is one plus the total
+  number of items with a larger logit. In other words,
+
+    rank_i = 1 + \sum_{j \neq i} I_{s_j > s_i},
+
+  where "I" is the indicator function. The indicator function can be
+  approximated by a generalized sigmoid:
+
+    I_{s_j < s_i} \approx 1/(1 + exp(-(s_j - s_i)/temperature)).
+
+  This function approximates the rank of an item using this sigmoid
+  approximation to the indicator function. This technique is at the core
+  of "A general approximation framework for direct optimization of
+  information retrieval measures" by Qin et al.
+
+  Args:
+    logits: A `Tensor` with shape [batch_size, list_size]. Each value is the
+      ranking score of the corresponding item.
+    temperature: A float number as the divider for logits.
+
+  Returns:
+    A `Tensor` of ranks with the same shape as logits.
+  """
+  list_size = tf.shape(input=logits)[1]
+  x = tf.tile(tf.expand_dims(logits, 2), [1, 1, list_size])
+  y = tf.tile(tf.expand_dims(logits, 1), [1, list_size, 1])
+  pairs = tf.sigmoid((y - x) / temperature)
+  return tf.reduce_sum(input_tensor=pairs, axis=-1) + .5
+
+
+def inverse_max_dcg(labels,
+                    gain_fn=lambda labels: tf.pow(2.0, labels) - 1.,
+                    rank_discount_fn=lambda rank: 1. / tf.math.log1p(rank),
+                    topn=None):
+  """Computes the inverse of max DCG.
+
+  Args:
+    labels: A `Tensor` with shape [batch_size, list_size]. Each value is the
+      graded relevance of the corresponding item.
+    gain_fn: A gain function. By default this is set to: 2^label - 1.
+    rank_discount_fn: A discount function. By default this is set to:
+      1/log(1+rank).
+    topn: An integer as the cutoff of examples in the sorted list.
+
+  Returns:
+    A `Tensor` with shape [batch_size, 1].
+  """
+  ideal_sorted_labels, = utils.sort_by_scores(labels, [labels], topn=topn)
+  rank = tf.range(tf.shape(input=ideal_sorted_labels)[1]) + 1
+  discounted_gain = gain_fn(ideal_sorted_labels) * rank_discount_fn(
+      tf.cast(rank, dtype=tf.float32))
+  discounted_gain = tf.reduce_sum(
+      input_tensor=discounted_gain, axis=1, keepdims=True)
+  return tf.compat.v1.where(
+      tf.greater(discounted_gain, 0.), 1. / discounted_gain,
+      tf.zeros_like(discounted_gain))
+
+
+def ndcg(labels, ranks=None, perm_mat=None):
+  """Computes NDCG from labels and ranks.
+
+  Args:
+    labels: A `Tensor` with shape [batch_size, list_size], representing graded
+      relevance.
+    ranks: A `Tensor` of the same shape as labels, or [1, list_size], or None.
+      If ranks=None, we assume the labels are sorted in their rank.
+    perm_mat: A `Tensor` with shape [batch_size, list_size, list_size] or None.
+      Permutation matrices with rows correpond to the ranks and columns
+      correspond to the indices. An argmax over each row gives the index of the
+      element at the corresponding rank.
+
+  Returns:
+    A `tensor` of NDCG, ApproxNDCG, or ExpectedNDCG of shape [batch_size, 1].
+  """
+  if ranks is not None and perm_mat is not None:
+    raise ValueError('Cannot use both ranks and perm_mat simultaneously.')
+
+  if ranks is None:
+    list_size = tf.shape(labels)[1]
+    ranks = tf.range(list_size) + 1
+  discounts = 1. / tf.math.log1p(tf.cast(ranks, dtype=tf.float32))
+  gains = tf.pow(2., tf.cast(labels, dtype=tf.float32)) - 1.
+  if perm_mat is not None:
+    gains = tf.reduce_sum(
+        input_tensor=perm_mat * tf.expand_dims(gains, 1), axis=-1)
+  dcg = tf.reduce_sum(input_tensor=gains * discounts, axis=-1, keepdims=True)
+  normalized_dcg = dcg * inverse_max_dcg(labels)
+
+  return normalized_dcg
+
+
 class _LambdaWeight(object):
   """Interface for ranking metric optimization.
 
@@ -129,7 +223,7 @@ class DCGLambdaWeight(_LambdaWeight):
     self._gain_fn = gain_fn
     self._rank_discount_fn = rank_discount_fn
     self._normalized = normalized
-    assert 0. <= smooth_fraction and smooth_fraction <= 1., (
+    assert 0. <= smooth_fraction <= 1., (
         'smooth_fraction %s should be in range [0, 1].' % smooth_fraction)
     self._smooth_fraction = smooth_fraction
 
@@ -140,7 +234,7 @@ class DCGLambdaWeight(_LambdaWeight):
       valid_pair, labels = _get_valid_pairs_and_clean_labels(labels)
       gain = self._gain_fn(labels)
       if self._normalized:
-        gain *= utils.inverse_max_dcg(
+        gain *= inverse_max_dcg(
             labels,
             gain_fn=self._gain_fn,
             rank_discount_fn=self._rank_discount_fn,
@@ -155,7 +249,7 @@ class DCGLambdaWeight(_LambdaWeight):
         """Rank-based discount in the LambdaLoss paper."""
         # The LambdaLoss is not well defined when topn is active and topn <
         # list_size. We cap the rank of examples to topn + 1 so that the rank
-        # differene is capped to topn. This is just a convenient upperbound
+        # difference is capped to topn. This is just a convenient upper bound
         # when topn is active. We need to revisit this.
         capped_rank = tf.compat.v1.where(
             tf.greater(ranks, topn),
@@ -202,7 +296,7 @@ class DCGLambdaWeight(_LambdaWeight):
           utils.is_label_valid(labels), labels, tf.zeros_like(labels))
       gain = self._gain_fn(labels)
       if self._normalized:
-        gain *= utils.inverse_max_dcg(
+        gain *= inverse_max_dcg(
             labels,
             gain_fn=self._gain_fn,
             rank_discount_fn=self._rank_discount_fn,
@@ -339,74 +433,81 @@ def _pairwise_comparison(labels, logits):
   return pairwise_labels, pairwise_logits
 
 
-def gumbel_softmax_sample(labels,
-                          logits,
-                          weights=None,
-                          name=None,
-                          sample_size=8,
-                          temperature=1.0,
-                          seed=None):
-  """Samples scores from Concrete(logits).
+class GumbelSampler(object):
+  """Random sampler for sampling gumbel distributed logits."""
 
-  Args:
-    labels: A `Tensor` of the same shape as `logits` representing graded
-      relevance.
-    logits: A `Tensor` with shape [batch_size, list_size]. Each value is the
-      ranking score of the corresponding item.
-    weights: A scalar, a `Tensor` with shape [batch_size, 1] for list-wise
-      weights, or a `Tensor` with shape [batch_size, list_size] for item-wise
-      weights. If None, the weight of a list in the mini-batch is set to the sum
-      of the labels of the items in that list.
-    name: A string used as the name for this loss.
-    sample_size: An integer representing the number of samples drawn from the
-      Concrete distribution defined by scores.
-    temperature: The Gumbel-Softmax temperature.
-    seed: Seed for pseudo-random number generator.
+  def __init__(self, name=None, sample_size=8, temperature=1.0, seed=None):
+    """Constructor."""
+    self._name = name
+    self._sample_size = sample_size
+    self._temperature = temperature
+    self._seed = seed
 
-  Returns:
-    A tuple of expanded labels, logits, and weights where the first dimension
-    is now batch_size * sample_size. Logit Tensors are sampled from
-    Concrete(logits) while labels and weights are simply tiled so the resulting
-    Tensor has the updated dimensions.
-  """
-  with tf.compat.v1.name_scope(name, 'gumbel_softmax_sample',
-                               (labels, logits, weights)):
-    batch_size = tf.shape(input=labels)[0]
-    list_size = tf.shape(input=labels)[1]
+  def sample(self, labels, logits, weights=None):
+    """Samples scores from Concrete(logits).
 
-    # Expand labels.
-    expanded_labels = tf.expand_dims(labels, 1)
-    expanded_labels = tf.tile(expanded_labels, [1, sample_size, 1])
-    expanded_labels = tf.reshape(expanded_labels,
-                                 [batch_size * sample_size, list_size])
+    Args:
+      labels: A `Tensor` with shape [batch_size, list_size] same as `logits`,
+        representing graded relevance. Or in the diversity tasks, a `Tensor`
+        with shape [batch_size, list_size, subtopic_size]. Each value represents
+        relevance to a subtopic, 1 for relevent subtopic, 0 for irrelevant, and
+        -1 for paddings. When the actual subtopic number of a query is smaller
+        than the `subtopic_size`, `labels` will be padded to `subtopic_size`
+        with -1.
+      logits: A `Tensor` with shape [batch_size, list_size]. Each value is the
+        ranking score of the corresponding item.
+      weights: A scalar, a `Tensor` with shape [batch_size, 1] for list-wise
+        weights, or a `Tensor` with shape [batch_size, list_size] for item-wise
+        weights. If None, the weight of a list in the mini-batch is set to the
+        sum of the labels of the items in that list.
 
-    # Sample logits from Concrete(logits).
-    sampled_logits = tf.expand_dims(logits, 1)
-    sampled_logits = tf.tile(sampled_logits, [1, sample_size, 1])
-    sampled_logits += _sample_gumbel([batch_size, sample_size, list_size],
-                                     seed=seed)
-    sampled_logits = tf.reshape(sampled_logits,
-                                [batch_size * sample_size, list_size])
+    Returns:
+      A tuple of expanded labels, logits, and weights where the first dimension
+      is now batch_size * sample_size. Logit Tensors are sampled from
+      Concrete(logits) while labels and weights are simply tiled so the
+      resulting
+      Tensor has the updated dimensions.
+    """
+    with tf.compat.v1.name_scope(self._name, 'gumbel_softmax_sample',
+                                 (labels, logits, weights)):
+      batch_size = tf.shape(input=labels)[0]
+      list_size = tf.shape(input=labels)[1]
 
-    is_label_valid = utils.is_label_valid(expanded_labels)
-    sampled_logits = tf.compat.v1.where(
-        is_label_valid, sampled_logits / temperature,
-        tf.math.log(1e-20) * tf.ones_like(sampled_logits))
-    sampled_logits = tf.math.log(tf.nn.softmax(sampled_logits) + 1e-20)
+      # Expand labels.
+      expanded_labels = tf.expand_dims(labels, 1)
+      expanded_labels = tf.repeat(expanded_labels, [self._sample_size], axis=1)
+      expanded_labels = utils.reshape_first_ndims(
+          expanded_labels, 2, [batch_size * self._sample_size])
 
-    expanded_weights = weights
-    if expanded_weights is not None:
-      true_fn = lambda: tf.expand_dims(tf.expand_dims(expanded_weights, 1), 1)
-      false_fn = lambda: tf.expand_dims(expanded_weights, 1)
-      expanded_weights = tf.cond(
-          pred=tf.math.equal(tf.rank(expanded_weights), 1),
-          true_fn=true_fn,
-          false_fn=false_fn)
-      expanded_weights = tf.tile(expanded_weights, [1, sample_size, 1])
-      expanded_weights = tf.reshape(expanded_weights,
-                                    [batch_size * sample_size, -1])
+      # Sample logits from Concrete(logits).
+      sampled_logits = tf.expand_dims(logits, 1)
+      sampled_logits = tf.tile(sampled_logits, [1, self._sample_size, 1])
+      sampled_logits += _sample_gumbel(
+          [batch_size, self._sample_size, list_size], seed=self._seed)
+      sampled_logits = tf.reshape(sampled_logits,
+                                  [batch_size * self._sample_size, list_size])
 
-    return expanded_labels, sampled_logits, expanded_weights
+      is_label_valid = utils.is_label_valid(expanded_labels)
+      if is_label_valid.shape.rank > 2:
+        is_label_valid = tf.reduce_any(is_label_valid, axis=-1)
+      sampled_logits = tf.compat.v1.where(
+          is_label_valid, sampled_logits / self._temperature,
+          tf.math.log(1e-20) * tf.ones_like(sampled_logits))
+      sampled_logits = tf.math.log(tf.nn.softmax(sampled_logits) + 1e-20)
+
+      expanded_weights = weights
+      if expanded_weights is not None:
+        true_fn = lambda: tf.expand_dims(tf.expand_dims(expanded_weights, 1), 1)
+        false_fn = lambda: tf.expand_dims(expanded_weights, 1)
+        expanded_weights = tf.cond(
+            pred=tf.math.equal(tf.rank(expanded_weights), 1),
+            true_fn=true_fn,
+            false_fn=false_fn)
+        expanded_weights = tf.tile(expanded_weights, [1, self._sample_size, 1])
+        expanded_weights = tf.reshape(expanded_weights,
+                                      [batch_size * self._sample_size, -1])
+
+      return expanded_labels, sampled_logits, expanded_weights
 
 
 def _sample_gumbel(shape, eps=1e-20, seed=None):
@@ -419,10 +520,22 @@ class _RankingLoss(object):
 
   __metaclass__ = abc.ABCMeta
 
-  @abc.abstractproperty
+  def __init__(self, name, lambda_weight=None, temperature=1.0):
+    """Constructor.
+
+    Args:
+      name: A string used as the name for this loss.
+      lambda_weight: A `_LambdaWeight` object.
+      temperature: A float number to modify the logits=logits/temperature.
+    """
+    self._name = name
+    self._lambda_weight = lambda_weight
+    self._temperature = temperature
+
+  @property
   def name(self):
     """The loss name."""
-    raise NotImplementedError('Calling an abstract method.')
+    return self._name
 
   @abc.abstractmethod
   def compute_unreduced_loss(self, labels, logits):
@@ -478,6 +591,7 @@ class _RankingLoss(object):
     Returns:
       Reduced loss for training and eval.
     """
+    logits = tf.convert_to_tensor(value=logits) / self._temperature
     losses, loss_weights = self.compute_unreduced_loss(labels, logits)
     weights = tf.multiply(self.normalize_weights(labels, weights), loss_weights)
     return tf.compat.v1.losses.compute_weighted_loss(
@@ -509,23 +623,6 @@ class _PairwiseLoss(_RankingLoss):
   """Interface for pairwise ranking loss."""
 
   __metaclass__ = abc.ABCMeta
-
-  def __init__(self, name, lambda_weight=None, params=None):
-    """Constructor.
-
-    Args:
-      name: A string used as the name for this loss.
-      lambda_weight: A `_LambdaWeight` object.
-      params: A dict for params used in loss computation.
-    """
-    self._name = name
-    self._lambda_weight = lambda_weight
-    self._params = params or {}
-
-  @property
-  def name(self):
-    """The loss name."""
-    return self._name
 
   @abc.abstractmethod
   def _pairwise_loss(self, pairwise_logits):
@@ -597,23 +694,6 @@ class PairwiseSoftZeroOneLoss(_PairwiseLoss):
 class _ListwiseLoss(_RankingLoss):
   """Interface for listwise loss."""
 
-  def __init__(self, name, lambda_weight=None, params=None):
-    """Constructor.
-
-    Args:
-      name: A string used as the name for this loss.
-      lambda_weight: A `_LambdaWeight` object.
-      params: A dict for params used in loss computation.
-    """
-    self._name = name
-    self._lambda_weight = lambda_weight
-    self._params = params or {}
-
-  @property
-  def name(self):
-    """The loss name."""
-    return self._name
-
   def normalize_weights(self, labels, weights):
     """See `_RankingLoss`."""
     if weights is None:
@@ -621,6 +701,8 @@ class _ListwiseLoss(_RankingLoss):
     else:
       weights = tf.convert_to_tensor(value=weights)
       labels = tf.convert_to_tensor(value=labels)
+      is_valid = utils.is_label_valid(labels)
+      labels = tf.where(is_valid, labels, tf.zeros_like(labels))
       return tf.compat.v1.math.divide_no_nan(
           tf.reduce_sum(input_tensor=(weights * labels), axis=1, keepdims=True),
           tf.reduce_sum(input_tensor=labels, axis=1, keepdims=True))
@@ -664,6 +746,7 @@ class SoftmaxLoss(_ListwiseLoss):
 
   def compute(self, labels, logits, weights, reduction):
     """See `_RankingLoss`."""
+    logits = tf.convert_to_tensor(value=logits) / self._temperature
     labels, logits = self.precompute(labels, logits, weights)
     losses, weights = self.compute_unreduced_loss(labels, logits)
     return tf.compat.v1.losses.compute_weighted_loss(
@@ -671,28 +754,46 @@ class SoftmaxLoss(_ListwiseLoss):
 
   def eval_metric(self, labels, logits, weights):
     """See `_RankingLoss`."""
+    logits = tf.convert_to_tensor(value=logits) / self._temperature
     labels, logits = self.precompute(labels, logits, weights)
     losses, weights = self.compute_unreduced_loss(labels, logits)
     return tf.compat.v1.metrics.mean(losses, weights)
 
 
+class UniqueSoftmaxLoss(_ListwiseLoss):
+  """Implements unique rating softmax loss."""
+
+  def compute_unreduced_loss(self, labels, logits):
+    """See `_RankingLoss`."""
+    is_valid = utils.is_label_valid(labels)
+    labels = tf.compat.v1.where(is_valid, labels, tf.zeros_like(labels))
+    logits = tf.compat.v1.where(is_valid, logits,
+                                tf.math.log(_EPSILON) * tf.ones_like(logits))
+    pairwise_labels, _ = _pairwise_comparison(labels, logits)
+    # Used in denominator to compute unique softmax probability for each doc.
+    denominator_logits = tf.expand_dims(logits, axis=1) * pairwise_labels
+    denominator_logits = tf.concat(
+        [denominator_logits, tf.expand_dims(logits, axis=2)], axis=2)
+    denominator_mask = tf.concat(
+        [pairwise_labels,
+         tf.expand_dims(tf.ones_like(logits), axis=2)], axis=2)
+    denominator_logits = tf.where(
+        tf.greater(denominator_mask, 0.0), denominator_logits, -1e-3 +
+        tf.reduce_min(denominator_logits) * tf.ones_like(denominator_logits))
+    logits_max = tf.reduce_max(denominator_logits, axis=-1, keepdims=True)
+    # Subtract the max so that exp(denominator_logits) is numerically valid.
+    denominator_logits -= logits_max
+    logits -= tf.squeeze(logits_max, axis=-1)
+    # Set gains for loss weights.
+    gains = tf.pow(2.0, labels) - 1
+    # Compute the softmax loss for each doc.
+    losses = -logits + tf.math.log(
+        tf.reduce_sum(tf.exp(denominator_logits) * denominator_mask, axis=-1))
+    return losses, gains
+
+
 class _PointwiseLoss(_RankingLoss):
   """Interface for pointwise loss."""
-
-  def __init__(self, name, params=None):
-    """Constructor.
-
-    Args:
-      name: A string used as the name for this loss.
-      params: A dict for params used in loss computation.
-    """
-    self._name = name
-    self._params = params or {}
-
-  @property
-  def name(self):
-    """The loss name."""
-    return self._name
 
   def normalize_weights(self, labels, weights):
     """See _RankingLoss."""
@@ -706,10 +807,21 @@ class _PointwiseLoss(_RankingLoss):
 class SigmoidCrossEntropyLoss(_PointwiseLoss):
   """Implements sigmoid cross entropy loss."""
 
+  def __init__(self, name, temperature=1.0):
+    """Overwrite the constructor.
+
+    Args:
+      name: A string used as the name for this loss.
+      temperature: A float number to modify the logits=logits/temperature.
+    """
+    super(SigmoidCrossEntropyLoss, self).__init__(name, None, temperature)
+
   def compute_unreduced_loss(self, labels, logits):
     """See `_RankingLoss`."""
     labels = tf.compat.v1.where(
         utils.is_label_valid(labels), labels, tf.zeros_like(labels))
+    logits = tf.compat.v1.where(
+        utils.is_label_valid(labels), logits, tf.zeros_like(logits))
     losses = tf.compat.v1.nn.sigmoid_cross_entropy_with_logits(
         labels=labels, logits=logits)
     return losses, 1.
@@ -717,6 +829,15 @@ class SigmoidCrossEntropyLoss(_PointwiseLoss):
 
 class MeanSquaredLoss(_PointwiseLoss):
   """Implements the means squared error loss."""
+
+  def __init__(self, name):
+    """Overwrite the constructor.
+
+    Args:
+      name: A string used as the name for this loss.
+    """
+    # temperature is not used in this loss.
+    super(MeanSquaredLoss, self).__init__(name, None, temperature=1.0)
 
   def compute_unreduced_loss(self, labels, logits):
     """See `_RankingLoss`."""
@@ -767,9 +888,13 @@ class ListMLELoss(_ListwiseLoss):
 class ApproxNDCGLoss(_ListwiseLoss):
   """Implements ApproxNDCG loss."""
 
+  # Use a different default temperature.
+  def __init__(self, name, lambda_weight=None, temperature=0.1):
+    """See `_ListwiseLoss`."""
+    super(ApproxNDCGLoss, self).__init__(name, lambda_weight, temperature)
+
   def compute_unreduced_loss(self, labels, logits):
     """See `_RankingLoss`."""
-    alpha = self._params.get('alpha', 10.0)
     is_valid = utils.is_label_valid(labels)
     labels = tf.compat.v1.where(is_valid, labels, tf.zeros_like(labels))
     logits = tf.compat.v1.where(
@@ -780,20 +905,22 @@ class ApproxNDCGLoss(_ListwiseLoss):
     nonzero_mask = tf.greater(tf.reshape(label_sum, [-1]), 0.0)
     labels = tf.compat.v1.where(nonzero_mask, labels,
                                 _EPSILON * tf.ones_like(labels))
-    gains = tf.pow(2., tf.cast(labels, dtype=tf.float32)) - 1.
-    ranks = utils.approx_ranks(logits, alpha=alpha)
-    discounts = 1. / tf.math.log1p(ranks)
-    dcg = tf.reduce_sum(input_tensor=gains * discounts, axis=-1, keepdims=True)
-    cost = -dcg * utils.inverse_max_dcg(labels)
-    return cost, tf.reshape(tf.cast(nonzero_mask, dtype=tf.float32), [-1, 1])
+    ranks = approx_ranks(logits, temperature=self._temperature)
+
+    return -ndcg(labels, ranks), tf.reshape(
+        tf.cast(nonzero_mask, dtype=tf.float32), [-1, 1])
 
 
 class ApproxMRRLoss(_ListwiseLoss):
   """Implements ApproxMRR loss."""
 
+  # Use a different default temperature.
+  def __init__(self, name, lambda_weight=None, temperature=0.1):
+    """See `_ListwiseLoss`."""
+    super(ApproxMRRLoss, self).__init__(name, lambda_weight, temperature)
+
   def compute_unreduced_loss(self, labels, logits):
     """See `_RankingLoss`."""
-    alpha = self._params.get('alpha', 10.0)
     is_valid = utils.is_label_valid(labels)
     labels = tf.compat.v1.where(is_valid, labels, tf.zeros_like(labels))
     logits = tf.compat.v1.where(
@@ -806,7 +933,7 @@ class ApproxMRRLoss(_ListwiseLoss):
     labels = tf.compat.v1.where(nonzero_mask, labels,
                                 _EPSILON * tf.ones_like(labels))
 
-    rr = 1. / utils.approx_ranks(logits, alpha=alpha)
+    rr = 1. / approx_ranks(logits, temperature=self._temperature)
     rr = tf.math.reduce_sum(input_tensor=rr * labels, axis=-1, keepdims=True)
     mrr = rr / tf.math.reduce_sum(input_tensor=labels, axis=-1, keepdims=True)
     return -mrr, tf.reshape(tf.cast(nonzero_mask, dtype=tf.float32), [-1, 1])
@@ -817,7 +944,6 @@ class NeuralSortCrossEntropyLoss(_ListwiseLoss):
 
   def compute_unreduced_loss(self, labels, logits):
     """See `_RankingLoss`."""
-    temperature = self._params.get('temperature', 0.1)
     is_valid = utils.is_label_valid(labels)
     labels = tf.compat.v1.where(is_valid, labels, tf.zeros_like(labels))
     logits = tf.compat.v1.where(
@@ -829,8 +955,8 @@ class NeuralSortCrossEntropyLoss(_ListwiseLoss):
     labels = tf.compat.v1.where(is_valid, labels, -1e3 * tf.ones_like(labels))
 
     # shape = [batch_size, list_size, list_size].
-    true_perm = neural_sort(labels, temperature=temperature)
-    smooth_perm = neural_sort(logits, temperature=temperature)
+    true_perm = neural_sort(labels, temperature=self._temperature)
+    smooth_perm = neural_sort(logits, temperature=self._temperature)
     losses = tf.compat.v1.nn.softmax_cross_entropy_with_logits_v2(
         labels=true_perm, logits=tf.math.log(1e-20 + smooth_perm), axis=2)
     # shape = [batch_size, list_size].

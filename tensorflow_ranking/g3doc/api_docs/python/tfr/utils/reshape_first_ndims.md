@@ -14,24 +14,56 @@
     <img src="https://www.tensorflow.org/images/GitHub-Mark-32px.png" />
     View source on GitHub
   </a>
-</td></table>
+</td>
+</table>
 
 Reshapes the first n dims of the input `tensor` to `new shape`.
 
-```python
-tfr.utils.reshape_first_ndims(
+<pre class="devsite-click-to-copy prettyprint lang-py tfo-signature-link">
+<code>tfr.utils.reshape_first_ndims(
     tensor, first_ndims, new_shape
 )
-```
+</code></pre>
 
 <!-- Placeholder for "Used in" -->
 
-#### Args:
+<!-- Tabular view -->
+ <table class="responsive fixed orange">
+<colgroup><col width="214px"><col></colgroup>
+<tr><th colspan="2"><h2 class="add-link">Args</h2></th></tr>
 
-*   <b>`tensor`</b>: The input `Tensor`.
-*   <b>`first_ndims`</b>: A int denoting the first n dims.
-*   <b>`new_shape`</b>: A list of int representing the new shape.
+<tr>
+<td>
+`tensor`
+</td>
+<td>
+The input `Tensor`.
+</td>
+</tr><tr>
+<td>
+`first_ndims`
+</td>
+<td>
+A int denoting the first n dims.
+</td>
+</tr><tr>
+<td>
+`new_shape`
+</td>
+<td>
+A list of int representing the new shape.
+</td>
+</tr>
+</table>
 
-#### Returns:
-
+<!-- Tabular view -->
+ <table class="responsive fixed orange">
+<colgroup><col width="214px"><col></colgroup>
+<tr><th colspan="2"><h2 class="add-link">Returns</h2></th></tr>
+<tr class="alt">
+<td colspan="2">
 A reshaped `Tensor`.
+</td>
+</tr>
+
+</table>

@@ -35,6 +35,7 @@ class RankingLossKey(object):
   PAIRWISE_LOGISTIC_LOSS = 'pairwise_logistic_loss'
   PAIRWISE_SOFT_ZERO_ONE_LOSS = 'pairwise_soft_zero_one_loss'
   SOFTMAX_LOSS = 'softmax_loss'
+  UNIQUE_SOFTMAX_LOSS = 'unique_softmax_loss'
   SIGMOID_CROSS_ENTROPY_LOSS = 'sigmoid_cross_entropy_loss'
   MEAN_SQUARED_LOSS = 'mean_squared_loss'
   LIST_MLE_LOSS = 'list_mle_loss'
@@ -51,7 +52,8 @@ def make_loss_fn(loss_keys,
                  lambda_weight=None,
                  reduction=tf.compat.v1.losses.Reduction.SUM_BY_NONZERO_WEIGHTS,
                  name=None,
-                 extra_args=None):
+                 params=None,
+                 gumbel_params=None):
   """Makes a loss function using a single loss or multiple losses.
 
   Args:
@@ -69,8 +71,10 @@ def make_loss_fn(loss_keys,
     reduction: One of `tf.losses.Reduction` except `NONE`. Describes how to
       reduce training loss over batch.
     name: A string used as the name for this loss.
-    extra_args: A string-keyed dictionary that contains any other loss-specific
+    params: A string-keyed dictionary that contains any other loss-specific
       arguments.
+    gumbel_params: A string-keyed dictionary that contains other
+      `gumbel_softmax_sample` arguments.
 
   Returns:
     A function _loss_fn(). See `_loss_fn()` for its signature.
@@ -93,6 +97,10 @@ def make_loss_fn(loss_keys,
   if loss_weights:
     if len(loss_keys) != len(loss_weights):
       raise ValueError('loss_keys and loss_weights must have the same size.')
+
+  params = params or {}
+  gumbel_params = gumbel_params or {}
+  gumbel_sampler = losses_impl.GumbelSampler(**gumbel_params)
 
   def _loss_fn(labels, logits, features):
     """Computes a single loss or weighted combination of losses.
@@ -117,8 +125,8 @@ def make_loss_fn(loss_keys,
       # Convert weights to a 2-D Tensor.
       weights = utils.reshape_to_2d(weights)
 
-    gbl_labels, gbl_logits, gbl_weights = losses_impl.gumbel_softmax_sample(
-        labels, logits, weights)
+    gbl_labels, gbl_logits, gbl_weights = gumbel_sampler.sample(
+        labels, logits, weights=weights)
 
     loss_kwargs = {
         'labels': labels,
@@ -134,9 +142,8 @@ def make_loss_fn(loss_keys,
         'reduction': reduction,
         'name': name,
     }
-    if extra_args is not None:
-      loss_kwargs.update(extra_args)
-      gbl_loss_kwargs.update(extra_args)
+    loss_kwargs.update(params)
+    gbl_loss_kwargs.update(params)
 
     loss_kwargs_with_lambda_weight = loss_kwargs.copy()
     loss_kwargs_with_lambda_weight['lambda_weight'] = lambda_weight
@@ -150,6 +157,8 @@ def make_loss_fn(loss_keys,
             (_pairwise_soft_zero_one_loss, loss_kwargs_with_lambda_weight),
         RankingLossKey.SOFTMAX_LOSS:
             (_softmax_loss, loss_kwargs_with_lambda_weight),
+        RankingLossKey.UNIQUE_SOFTMAX_LOSS:
+            (_unique_softmax_loss, loss_kwargs_with_lambda_weight),
         RankingLossKey.SIGMOID_CROSS_ENTROPY_LOSS:
             (_sigmoid_cross_entropy_loss, loss_kwargs),
         RankingLossKey.MEAN_SQUARED_LOSS: (_mean_squared_loss, loss_kwargs),
@@ -218,6 +227,8 @@ def make_loss_metric_fn(loss_key,
               name, lambda_weight=lambda_weight),
       RankingLossKey.SOFTMAX_LOSS:
           losses_impl.SoftmaxLoss(name, lambda_weight=lambda_weight),
+      RankingLossKey.UNIQUE_SOFTMAX_LOSS:
+          losses_impl.UniqueSoftmaxLoss(name, lambda_weight=lambda_weight),
       RankingLossKey.SIGMOID_CROSS_ENTROPY_LOSS:
           losses_impl.SigmoidCrossEntropyLoss(name),
       RankingLossKey.MEAN_SQUARED_LOSS:
@@ -446,6 +457,47 @@ def _softmax_loss(
     return loss.compute(labels, logits, weights, reduction)
 
 
+def _unique_softmax_loss(
+    labels,
+    logits,
+    weights=None,
+    lambda_weight=None,
+    reduction=tf.compat.v1.losses.Reduction.SUM_BY_NONZERO_WEIGHTS,
+    name=None):
+  """Computes the unique rating softmax cross entropy for a list.
+
+  This is the uRank loss originally proposed by Zhu and Klabjan in
+  ["Listwise Learning to Rank by Exploring Unique Ratings"] and is
+  appropriate for datasets with multiple relevance labels.
+
+  Given the labels l_i and the logits s_i, the unique softmax loss is defined as
+      -sum_i (2^l_i - 1) * log(exp(s_i) / (sum_j exp(s_j) + exp(s_i))),
+  where j is over the documents with l_j < l_i.
+
+  TODO: Add the lambda_weight support.
+
+  Args:
+    labels: A `Tensor` of the same shape as `logits` representing graded
+      relevance.
+    logits: A `Tensor` with shape [batch_size, list_size]. Each value is the
+      ranking score of the corresponding item.
+    weights: A scalar, a `Tensor` with shape [batch_size, 1] for list-wise
+      weights, or a `Tensor` with shape [batch_size, list_size] for item-wise
+      weights.
+    lambda_weight: A `DCGLambdaWeight` instance.
+    reduction: One of `tf.losses.Reduction` except `NONE`. Describes how to
+      reduce training loss over batch.
+    name: A string used as the name for this loss.
+
+  Returns:
+    An op for the softmax cross entropy as a loss.
+  """
+  loss = losses_impl.UniqueSoftmaxLoss(name, lambda_weight)
+  with tf.compat.v1.name_scope(loss.name, 'unique_softmax_loss',
+                               (labels, logits, weights)):
+    return loss.compute(labels, logits, weights, reduction)
+
+
 def _sigmoid_cross_entropy_loss(
     labels,
     logits,
@@ -519,9 +571,7 @@ def _list_mle_loss(
     lambda_weight=None,
     reduction=tf.compat.v1.losses.Reduction.SUM_BY_NONZERO_WEIGHTS,
     name=None):
-  """Computes the ListMLE loss [Xia et al.
-
-  2008] for a list.
+  """Computes the ListMLE loss in (Xia et al 2008) for a list.
 
   Given the labels of graded relevance l_i and the logits s_i, we calculate
   the ListMLE loss for the given list.
@@ -558,7 +608,7 @@ def _approx_ndcg_loss(labels,
                       weights=None,
                       reduction=tf.compat.v1.losses.Reduction.SUM,
                       name=None,
-                      alpha=10.):
+                      temperature=0.1):
   """Computes ApproxNDCG loss.
 
   ApproxNDCG ["A general approximation framework for direct optimization of
@@ -579,12 +629,12 @@ def _approx_ndcg_loss(labels,
     reduction: One of `tf.losses.Reduction` except `NONE`. Describes how to
       reduce training loss over batch.
     name: A string used as the name for this loss.
-    alpha: The exponent in the generalized sigmoid function.
+    temperature: The temperature used to scale logits=logits/temperature.
 
   Returns:
     An op for the ApproxNDCG loss.
   """
-  loss = losses_impl.ApproxNDCGLoss(name, params={'alpha': alpha})
+  loss = losses_impl.ApproxNDCGLoss(name, temperature=temperature)
   with tf.compat.v1.name_scope(loss.name, 'approx_ndcg_loss',
                                (labels, logits, weights)):
     return loss.compute(labels, logits, weights, reduction)
@@ -595,7 +645,7 @@ def _approx_mrr_loss(labels,
                      weights=None,
                      reduction=tf.compat.v1.losses.Reduction.SUM,
                      name=None,
-                     alpha=10.):
+                     temperature=0.1):
   """Computes ApproxMRR loss.
 
   ApproxMRR ["A general approximation framework for direct optimization of
@@ -614,12 +664,12 @@ def _approx_mrr_loss(labels,
     reduction: One of `tf.losses.Reduction` except `NONE`. Describes how to
       reduce training loss over batch.
     name: A string used as the name for this loss.
-    alpha: The exponent in the generalized sigmoid function.
+    temperature: The temperature used to scale logits=logits/temperature.
 
   Returns:
     An op for the ApproxMRR loss.
   """
-  loss = losses_impl.ApproxMRRLoss(name, params={'alpha': alpha})
+  loss = losses_impl.ApproxMRRLoss(name, temperature=temperature)
   with tf.compat.v1.name_scope(loss.name, 'approx_mrr_loss',
                                (labels, logits, weights)):
     return loss.compute(labels, logits, weights, reduction)
@@ -649,13 +699,12 @@ def _neural_sort_cross_entropy_loss(labels,
     reduction: One of `tf.losses.Reduction` except `NONE`. Describes how to
       reduce training loss over batch.
     name: A string used as the name for this loss.
-    temperature: The exponent in the smooth softmax function.
+    temperature: The temperature used to scale logits=logits/temperature.
 
   Returns:
     An op for the NeuralSort CrossEntropy loss.
   """
-  loss = losses_impl.NeuralSortCrossEntropyLoss(
-      name, params={'temperature': temperature})
+  loss = losses_impl.NeuralSortCrossEntropyLoss(name, temperature=temperature)
   with tf.compat.v1.name_scope(loss.name, 'neural_sort_cross_entropy_loss',
                                (labels, logits, weights)):
     return loss.compute(labels, logits, weights, reduction)

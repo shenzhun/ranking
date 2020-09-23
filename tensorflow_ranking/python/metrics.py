@@ -54,8 +54,14 @@ class RankingMetricKey(object):
   # Mean Average Precision. For binary relevance.
   MAP = 'map'
 
+  # PrecisionIA. For binary relevance of subtopics.
+  PRECISION_IA = 'precision_ia'
+
   # Ordered Pair Accuracy.
   ORDERED_PAIR_ACCURACY = 'ordered_pair_accuracy'
+
+  # Alpha Discounted Cumulative Gain.
+  ALPHA_DCG = 'alpha_dcg'
 
 
 def compute_mean(metric_key,
@@ -103,7 +109,8 @@ def make_ranking_metric_fn(metric_key,
                            topn=None,
                            name=None,
                            gain_fn=_DEFAULT_GAIN_FN,
-                           rank_discount_fn=_DEFAULT_RANK_DISCOUNT_FN):
+                           rank_discount_fn=_DEFAULT_RANK_DISCOUNT_FN,
+                           **kwargs):
   """Factory method to create a ranking metric function.
 
   Args:
@@ -121,6 +128,7 @@ def make_ranking_metric_fn(metric_key,
       the discount parameters used in the definitions of DCG and NDCG metrics,
       where the input in the rank of item. The discount function is commonly
       defined to be of the form log(rank+1).
+    **kwargs: Other keyword arguments (e.g. alpha, seed).
 
   Returns:
     A metric fn with the following Args:
@@ -194,10 +202,30 @@ def make_ranking_metric_fn(metric_key,
         topn=topn,
         name=name)
 
+  def _precision_ia_fn(labels, predictions, features):
+    """Returns an intent-aware precision as the metric."""
+    return precision_ia(
+        labels,
+        predictions,
+        weights=_get_weights(features),
+        topn=topn,
+        name=name)
+
   def _ordered_pair_accuracy_fn(labels, predictions, features):
     """Returns ordered pair accuracy as the metric."""
     return ordered_pair_accuracy(
         labels, predictions, weights=_get_weights(features), name=name)
+
+  def _alpha_discounted_cumulative_gain_fn(labels, predictions, features):
+    """Returns alpha discounted cumulative gain as the metric."""
+    return alpha_discounted_cumulative_gain(
+        labels,
+        predictions,
+        weights=_get_weights(features),
+        topn=topn,
+        name=name,
+        rank_discount_fn=rank_discount_fn,
+        **kwargs)
 
   metric_fn_dict = {
       RankingMetricKey.ARP: _average_relevance_position_fn,
@@ -206,7 +234,9 @@ def make_ranking_metric_fn(metric_key,
       RankingMetricKey.DCG: _discounted_cumulative_gain_fn,
       RankingMetricKey.PRECISION: _precision_fn,
       RankingMetricKey.MAP: _mean_average_precision_fn,
+      RankingMetricKey.PRECISION_IA: _precision_ia_fn,
       RankingMetricKey.ORDERED_PAIR_ACCURACY: _ordered_pair_accuracy_fn,
+      RankingMetricKey.ALPHA_DCG: _alpha_discounted_cumulative_gain_fn,
   }
   assert metric_key in metric_fn_dict, ('metric_key %s not supported.' %
                                         metric_key)
@@ -322,6 +352,30 @@ def mean_average_precision(labels,
   return tf.compat.v1.metrics.mean(per_list_map, per_list_weights)
 
 
+def precision_ia(labels, predictions, weights=None, topn=None, name=None):
+  """Computes Intent-Aware Precision as weighted average of relevant examples.
+
+  Args:
+    labels: A `Tensor` with shape [batch_size, list_size, subtopic_size]. A
+      nonzero value means that the example covers the corresponding subtopic.
+    predictions: A `Tensor` with shape [batch_size, list_size]. Each value is
+      the ranking score of the corresponding example.
+    weights: A `Tensor` of the same shape of predictions or [batch_size, 1]. The
+      former case is per-example and the latter case is per-list.
+    topn: A cutoff for how many examples to consider for this metric.
+    name: A string used as the name for this metric.
+
+  Returns:
+    A metric for the weighted precision of the batch.
+  """
+  metric = metrics_impl.PrecisionIAMetric(name, topn)
+  with tf.compat.v1.name_scope(metric.name, 'precision_ia',
+                               (labels, predictions, weights)):
+    precision_at_k, per_list_weights = metric.compute(labels, predictions,
+                                                      weights)
+  return tf.compat.v1.metrics.mean(precision_at_k, per_list_weights)
+
+
 def normalized_discounted_cumulative_gain(
     labels,
     predictions,
@@ -340,8 +394,12 @@ def normalized_discounted_cumulative_gain(
       former case is per-example and the latter case is per-list.
     topn: A cutoff for how many examples to consider for this metric.
     name: A string used as the name for this metric.
-    gain_fn: (function) Transforms labels.
-    rank_discount_fn: (function) The rank discount function.
+    gain_fn: (function) Transforms labels. Note that this implementation of
+      NDCG assumes that this function is *increasing* as a function of its
+      imput.
+    rank_discount_fn: (function) The rank discount function. Note that this
+      implementation of NDCG assumes that this function is *decreasing* as a
+      function of its imput.
 
   Returns:
     A metric for the weighted normalized discounted cumulative gain of the
@@ -384,6 +442,51 @@ def discounted_cumulative_gain(labels,
                                (labels, predictions, weights)):
     dcg, per_list_weights = metric.compute(labels, predictions, weights)
   return tf.compat.v1.metrics.mean(dcg, per_list_weights)
+
+
+def alpha_discounted_cumulative_gain(
+    labels,
+    predictions,
+    weights=None,
+    topn=None,
+    name=None,
+    rank_discount_fn=_DEFAULT_RANK_DISCOUNT_FN,
+    alpha=0.5,
+    seed=None):
+  """Computes alpha discounted cumulative gain (alpha-DCG).
+
+  Args:
+    labels: A `Tensor` with shape [batch_size, list_size, subtopic_size]. Each
+      value represents graded relevance to a subtopic: 1 for relevent subtopic,
+      0 for irrelevant, and -1 for paddings. When the actual subtopic number
+      of a query is smaller than the `subtopic_size`, `labels` will be padded
+      to `subtopic_size` with -1, similar to the paddings used for queries
+      with doc number less then list_size.
+    predictions: A `Tensor` with shape [batch_size, list_size]. Each value is
+      the ranking score of the corresponding example.
+    weights: A `Tensor` of shape [batch_size, list_size] or [batch_size, 1].
+      They are per-example and per-list, respectively.
+    topn: A cutoff for how many examples to consider for this metric.
+    name: A string used as the name for this metric.
+    rank_discount_fn: A function of rank discounts. Default is set to
+      discount = 1 / log2(rank+1).
+    alpha: A float between 0 and 1. Originally introduced as an assessor error
+      in judging whether a document is covering a subtopic of the query. It
+      can also be interpreted as the inverse number of documents covering the
+      same subtopic reader needs to get and confirm the subtopic information
+      of a query.
+    seed: The ops-level random seed used in shuffle ties in `sort_by_scores`.
+
+  Returns:
+    A metric for the weighted alpha discounted cumulative gain of the batch.
+  """
+  metric = metrics_impl.AlphaDCGMetric(name, topn, alpha=alpha,
+                                       rank_discount_fn=rank_discount_fn,
+                                       seed=seed)
+  with tf.compat.v1.name_scope(name, 'alpha_discounted_cumulative_gain',
+                               (labels, predictions, weights)):
+    alpha_dcg, per_list_weights = metric.compute(labels, predictions, weights)
+  return tf.compat.v1.metrics.mean(alpha_dcg, per_list_weights)
 
 
 def ordered_pair_accuracy(labels, predictions, weights=None, name=None):

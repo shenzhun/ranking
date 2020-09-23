@@ -59,6 +59,30 @@ class UtilsTest(tf.test.TestCase):
         self.assertAllEqual(sorted_positions, [[2, 3, 1]])
         self.assertAllEqual(sorted_names, [[b'b', b'c', b'a']])
 
+  def test_sort_by_scores_for_3d_features(self):
+    with tf.Graph().as_default():
+      scores = [[1., 3., 2.], [1., 2., 3.]]
+      example_feature = [[[1., 2., 3.], [4., 5., 6.], [7., 8., 9.]],
+                         [[10., 20., 30.], [40., 50., 60.], [70., 80., 90.]]]
+      with tf.compat.v1.Session() as sess:
+        sorted_example_feature = sess.run(
+            utils.sort_by_scores(scores, [example_feature])[0])
+        self.assertAllEqual(
+            sorted_example_feature,
+            [[[4., 5., 6.], [7., 8., 9.], [1., 2., 3.]],
+             [[70., 80., 90.], [40., 50., 60.], [10., 20., 30.]]])
+
+        sorted_example_feature = sess.run(
+            utils.sort_by_scores(scores, [example_feature], topn=2)[0])
+        self.assertAllEqual(
+            sorted_example_feature,
+            [[[4., 5., 6.], [7., 8., 9.]], [[70., 80., 90.], [40., 50., 60.]]])
+
+        sorted_example_feature = sess.run(
+            utils.sort_by_scores([scores[0]], [[example_feature[0]]])[0])
+        self.assertAllEqual(sorted_example_feature,
+                            [[[4., 5., 6.], [7., 8., 9.], [1., 2., 3.]]])
+
   def test_sort_by_scores_shuffle_ties(self):
     with tf.Graph().as_default():
       tf.compat.v1.set_random_seed(589)
@@ -140,30 +164,6 @@ class UtilsTest(tf.test.TestCase):
         self.assertAllEqual(reshaped_array.dense_shape,
                             target_array.dense_shape)
 
-  def test_approx_ranks(self):
-    with tf.Graph().as_default():
-      logits = [[1., 3., 2., 0.], [4., 2., 1.5, 3.]]
-      target_ranks = [[3., 1., 2., 4.], [1., 3., 4., 2.]]
-
-      approx_ranks = utils.approx_ranks(logits, 100.)
-      with tf.compat.v1.Session() as sess:
-        approx_ranks = sess.run(approx_ranks)
-        self.assertAllClose(approx_ranks, target_ranks)
-
-  def test_inverse_max_dcg(self):
-    with tf.Graph().as_default():
-      labels = [[1., 4., 1., 0.], [4., 2., 0., 3.], [0., 0., 0., 0.]]
-      target = [[0.04297], [0.033139], [0.]]
-      target_1 = [[0.04621], [0.04621], [0.]]
-
-      inverse_max_dcg = utils.inverse_max_dcg(labels)
-      inverse_max_dcg_1 = utils.inverse_max_dcg(labels, topn=1)
-      with tf.compat.v1.Session() as sess:
-        inverse_max_dcg = sess.run(inverse_max_dcg)
-        self.assertAllClose(inverse_max_dcg, target)
-        inverse_max_dcg_1 = sess.run(inverse_max_dcg_1)
-        self.assertAllClose(inverse_max_dcg_1, target_1)
-
   def test_reshape_to_2d(self):
     with tf.Graph().as_default():
       tensor_3d = tf.constant([[[1], [2], [3]], [[4], [5], [6]]])
@@ -239,77 +239,31 @@ class UtilsTest(tf.test.TestCase):
         # shape = [2, 3] = [batch_size, list_size]
         self.assertAllEqual(mask, [[True, True, True], [True, True, False]])
 
-  def test_scatter_to_2d(self):
+  def test_de_noise(self):
     with tf.Graph().as_default():
-      segments = [0, 0, 0, 1, 2, 2]
-      tensor = [0, 0, 0, 1, 2, 2]
-      pad_value = -1
-      expected = [[0, 0, 0], [1, -1, -1], [2, 2, -1]]
+      counts = [[1, 2, 3], [1, 2, 3]]
+      noise = [[3, 3, 4], [3, 2, 1]]
       with tf.compat.v1.Session() as sess:
-        tensor_2d = sess.run(utils.scatter_to_2d(tensor, segments, pad_value))
-        self.assertAllEqual(tensor_2d, expected)
+        # Larger noise ratio -> the results are more sharp.
+        de_noised = sess.run(utils.de_noise(counts, noise, ratio=0.9))
+        self.assertAllClose(de_noised, [[0., 0.22, 0.78], [0., 0., 1.]])
+        # Smaller noise ratio -> the results are close to counts.
+        de_noised = sess.run(utils.de_noise(counts, noise, ratio=0.1))
+        self.assertAllClose(de_noised, [
+            [0.151852, 0.337037, 0.511111],
+            [0.12963, 0.333333, 0.537037],
+        ])
 
-  def test_scatter_to_2d_not_sorted(self):
+  def test_de_noise_exception(self):
     with tf.Graph().as_default():
-      segments = [0, 0, 1, 0, 2, 2]
-      tensor = [0, 0, 1, 0, 2, 2]
-      pad_value = -1
-      expected = [[0, 0, 0], [1, -1, -1], [2, 2, -1]]
-      with tf.compat.v1.Session() as sess:
-        tensor_2d = sess.run(utils.scatter_to_2d(tensor, segments, pad_value))
-        self.assertAllEqual(tensor_2d, expected)
-
-  def test_scatter_to_2d_with_larger_output_shape(self):
-    with tf.Graph().as_default():
-      segments = [0, 0, 0, 1, 2, 2]
-      tensor = [0, 0, 0, 1, 2, 2]
-      pad_value = -1
-      larger_output_shape = [4, 4]
-      larger_expected = [
-          [0, 0, 0, -1],
-          [1, -1, -1, -1],
-          [2, 2, -1, -1],
-          [-1, -1, -1, -1],
-      ]
-      with tf.compat.v1.Session() as sess:
-        tensor_2d = sess.run(
-            utils.scatter_to_2d(tensor, segments, pad_value,
-                                larger_output_shape))
-        self.assertAllEqual(tensor_2d, larger_expected)
-
-  def test_scatter_to_2d_with_smaller_output_shape(self):
-    with tf.Graph().as_default():
-      segments = [0, 0, 0, 1, 2, 2]
-      tensor = [1, 0, 0, 1, 2, 2]
-      pad_value = -1
-      smaller_output_shape = [2, 2]
-      smaller_expected = [
-          [1, 0],
-          [1, -1],
-      ]
-      with tf.compat.v1.Session() as sess:
-        tensor_2d = sess.run(
-            utils.scatter_to_2d(tensor, segments, pad_value,
-                                smaller_output_shape))
-        self.assertAllEqual(tensor_2d, smaller_expected)
-
-  def test_segment_sorted_ranks(self):
-    with tf.Graph().as_default():
-      scores = [1., 3., 2., 1., 2., 3.]
-      segments = [0, 0, 0, 1, 2, 2]
-      expected = [3, 1, 2, 1, 2, 1]
-      with tf.compat.v1.Session() as sess:
-        ranks = sess.run(utils.segment_sorted_ranks(scores, segments, seed=1))
-        self.assertAllEqual(ranks, expected)
-
-  def test_segment_sorted_ranks_not_clustered(self):
-    with tf.Graph().as_default():
-      scores = [1., 3., 1., 2., 2., 3.]
-      segments = [0, 0, 1, 0, 2, 2]
-      expected = [3, 1, 1, 2, 2, 1]
-      with tf.compat.v1.Session() as sess:
-        ranks = sess.run(utils.segment_sorted_ranks(scores, segments, seed=1))
-        self.assertAllEqual(ranks, expected)
+      with self.assertRaises(ValueError):
+        utils.de_noise([[1, 2, 3]], [[1, 2, 3]], ratio=1.1)
+      with self.assertRaises(ValueError):
+        utils.de_noise([[1, 2, 3]], [[1, 2, 3]], ratio=-0.1)
+      with self.assertRaises(tf.errors.InvalidArgumentError):
+        utils.de_noise([[-1, 2, 3]], [[1, 2, 3]])
+      with self.assertRaises(tf.errors.InvalidArgumentError):
+        utils.de_noise([[1, 2, 3]], [[0, 2, 3]])
 
 
 if __name__ == '__main__':

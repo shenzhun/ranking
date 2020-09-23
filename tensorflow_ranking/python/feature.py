@@ -132,7 +132,7 @@ def encode_listwise_features(features,
   Returns:
     context_features: (dict) A mapping from context feature names to dense
     2-D tensors of shape [batch_size, ...].
-    example_features: (dict) A mapping frome example feature names to dense
+    example_features: (dict) A mapping from example feature names to dense
     3-D tensors of shape [batch_size, input_size, ...].
 
   Raises:
@@ -148,14 +148,19 @@ def encode_listwise_features(features,
         for name, col in six.iteritems(context_feature_columns)
     }
 
-  # Compute example_features. Note that the key in `example_feature_columns`
-  # dict can be different from the key in the `features` dict. We only need to
+  # Compute example_features. Note that the keys in `example_feature_columns`
+  # dict can be different from the keys in the `features` dict. We only need to
   # reshape the per-example tensors in `features`. To obtain the keys for
   # per-example features, we use the parsing feature specs.
   example_features = {}
   if example_feature_columns:
-    example_specs = tf.feature_column.make_parse_example_spec(
-        example_feature_columns.values())
+    if feature_column_lib.is_feature_column_v2(
+        example_feature_columns.values()):
+      example_specs = tf.compat.v2.feature_column.make_parse_example_spec(
+          example_feature_columns.values())
+    else:
+      example_specs = tf.compat.v1.feature_column.make_parse_example_spec(
+          example_feature_columns.values())
     example_name = next(six.iterkeys(example_specs))
     batch_size = tf.shape(input=features[example_name])[0]
     if input_size is None:
@@ -172,7 +177,7 @@ def encode_listwise_features(features,
             features[name], 2, [batch_size * input_size])
       except:
         raise ValueError(
-            "2nd dimesion of tensor must be equal to input size: {}, "
+            "2nd dimension of tensor must be equal to input size: {}, "
             "but found feature {} with shape {}.".format(
                 input_size, name, features[name].get_shape()))
 
@@ -209,7 +214,7 @@ def encode_pointwise_features(features,
   Returns:
     context_features: (dict) A mapping from context feature names to dense
     2-D tensors of shape [batch_size, ...].
-    example_features: (dict) A mapping frome example feature names to dense
+    example_features: (dict) A mapping from example feature names to dense
     3-D tensors of shape [batch_size, 1, ...].
   """
   context_features = {}

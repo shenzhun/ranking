@@ -24,30 +24,56 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import inspect
-
 import tensorflow as tf
 
+from tensorflow.python.util import function_utils
 from tensorflow_ranking.python import feature
 from tensorflow_ranking.python import head
 from tensorflow_ranking.python import losses
 from tensorflow_ranking.python import metrics
 from tensorflow_ranking.python import model
 
+_METRIC_WEIGHT = "metric_weights_feature_name"
+_LOSS_WEIGHT = "loss_weights_feature_name"
 
-def _validate_hparams(hparams_in_dict, required_keys):
-  """Asserts all of the `required_keys` are presented in `hparams_in_dict`.
+# Postfix for names of subscore tensors in GAM.
+_SUBSCORE_POSTFIX = "subscore"
+
+# Postfix for names of subweight tensors in GAM.
+_SUBWEIGHT_POSTFIX = "subweight"
+
+
+def _validate_hparams(hparams_in_dict, required_keys, allowed_keys=None):
+  """Validate keys in `hparams_in_dict`.
+
+  It asserts all of the `required_keys` are presented in `hparams_in_dict`. It
+  also prints all the allowed keys as info. The main purpose is to allow for
+  easy debugging, because a mis-spelled allowed key uses the default value
+  (e.g., None) silently.
+
+  A hparams can contain extra keys other than `required_keys` and `allowed_keys`
+  and this function does nothing about them.
 
   Args:
     hparams_in_dict: (dict) A dict with the key in string and value in any type.
-    required_keys: (list) A list of strings.
+    required_keys: (list) A list of strings for required keys.
+    allowed_keys: (list) A list of strings for allowed but not requried keys.
 
   Raises:
     ValueError: If any of `required_keys` does not present in `hparams_in_dict`.
   """
+  required_keys = required_keys or []
+  allowed_keys = allowed_keys or []
   for required_key in required_keys:
     if required_key not in hparams_in_dict:
       raise ValueError("Required key is missing: '{}'".format(required_key))
+  for allowed_key in allowed_keys:
+    if allowed_key in hparams_in_dict:
+      tf.compat.v1.logging.info("Allowed key is set: {}={}".format(
+          allowed_key, hparams_in_dict.get(allowed_key)))
+    else:
+      tf.compat.v1.logging.info(
+          "Allowed key is not set: {}".format(allowed_key))
 
 
 def _validate_function_args(function, required_args):
@@ -60,21 +86,34 @@ def _validate_function_args(function, required_args):
   Raises:
     ValueError: If any of `required_args` does not present in the `function`.
   """
-  fn_args = None
-  try:
-    # This is for Python 3.
-    fn_spec = inspect.getfullargspec(function)
-    fn_args = [arg for arg in fn_spec.args if arg != "self"]
-  except AttributeError:
-    # This is for Python 2.
-    fn_spec = inspect.getargspec(function)
-    fn_args = [arg for arg in fn_spec.args if arg != "self"]
-
+  fn_args = function_utils.fn_args(function)
   if set(fn_args) != set(required_args):
     raise ValueError(
         "Function `%s` needs to have the following arguments: %s."
         " What were provided are the following: %s." %
         (function.__name__, sorted(required_args), sorted(fn_args)))
+
+
+def _get_metric_pair(key, weight=None, topn=None):
+  """Helper function to construct metric name and function."""
+  name = "".join([
+      "metric/",
+      "weighted_" if weight else "",
+      key,
+      "_%s" % topn if topn else "",
+  ])
+  return name, metrics.make_ranking_metric_fn(
+      key, weights_feature_name=weight, topn=topn)
+
+
+def _get_loss_metric_pair(key, weight=None):
+  """Helper function to construct metric name and function for a loss."""
+  name = "".join([
+      "metric/",
+      "weighted_" if weight else "",
+      key,
+  ])
+  return name, losses.make_loss_metric_fn(key, weights_feature_name=weight)
 
 
 class EstimatorBuilder(object):
@@ -100,6 +139,7 @@ class EstimatorBuilder(object):
   }
   hparams = dict(
       checkpoint_secs=120,
+      listwise_inference=False,
       loss="softmax_loss",
       model_dir="/path/to/your/model_dir/",
       num_checkpoints=100)
@@ -212,14 +252,19 @@ class EstimatorBuilder(object):
 
   def _required_hparam_keys(self):
     """Returns a list of keys for required hparams."""
-    required_hparam_keys = [
-        "checkpoint_secs", "loss", "model_dir", "num_checkpoints"
+    return [
+        "checkpoint_secs", "listwise_inference", "loss", "model_dir",
+        "num_checkpoints"
     ]
-    return required_hparam_keys
+
+  def _allowed_hparam_keys(self):
+    """Returns a list of allowed but not required keys for hparams."""
+    return [_METRIC_WEIGHT, _LOSS_WEIGHT]
 
   def _validate_function_args_and_hparams(self):
     """Validates that the hparams and arguments are all as required."""
-    _validate_hparams(self._hparams, self._required_hparam_keys())
+    _validate_hparams(self._hparams, self._required_hparam_keys(),
+                      self._allowed_hparam_keys())
     _validate_function_args(
         self._scoring_function,
         required_args=["context_features", "example_features", "mode"])
@@ -232,7 +277,8 @@ class EstimatorBuilder(object):
     if self._transform_function is not None:
       return self._transform_function(features=features, mode=mode)
 
-    if mode == tf.estimator.ModeKeys.PREDICT:
+    if (mode == tf.estimator.ModeKeys.PREDICT and
+        not self._hparams.get("listwise_inference")):
       return feature.encode_pointwise_features(
           features=features,
           context_feature_columns=self._context_feature_columns,
@@ -251,17 +297,33 @@ class EstimatorBuilder(object):
     """Returns a dict from name to metric functions."""
     metric_fns = {}
     metric_fns.update({
-        "metric/ndcg_%d" % topn: metrics.make_ranking_metric_fn(
-            metrics.RankingMetricKey.NDCG, topn=topn) for topn in [5, 10]
+        _get_metric_pair(metrics.RankingMetricKey.NDCG, topn=topn)
+        for topn in [5, 10, None]
     })
     metric_fns.update({
-        "metric/mrr_%d" % topn: metrics.make_ranking_metric_fn(
-            metrics.RankingMetricKey.MRR, topn=topn) for topn in [10]
+        _get_metric_pair(metrics.RankingMetricKey.MRR, topn=topn)
+        for topn in [10, None]
     })
-    metric_fns.update({
-        "metric/%s" % name: metrics.make_ranking_metric_fn(name) for name in
-        [metrics.RankingMetricKey.MRR, metrics.RankingMetricKey.NDCG]
-    })
+
+    metric_fns.update({_get_loss_metric_pair(self._hparams.get("loss"))})
+
+    if self._hparams.get(_METRIC_WEIGHT):
+      weight = self._hparams.get(_METRIC_WEIGHT)
+      tf.compat.v1.logging.info("Metric weight %s=%s" %
+                                (_METRIC_WEIGHT, weight))
+      metric_fns.update({
+          _get_metric_pair(
+              metrics.RankingMetricKey.NDCG, weight=weight, topn=topn)
+          for topn in [5, 10, None]
+      })
+      metric_fns.update({
+          _get_metric_pair(
+              metrics.RankingMetricKey.MRR, weight=weight, topn=topn)
+          for topn in [10, None]
+      })
+      metric_fns.update(
+          {_get_loss_metric_pair(self._hparams.get("loss"), weight=weight)})
+
     return metric_fns
 
   def _group_score_fn(self, context_features, group_features, mode, params,
@@ -296,7 +358,9 @@ class EstimatorBuilder(object):
 
     ranking_head = head.create_ranking_head(
         loss_fn=losses.make_loss_fn(
-            self._hparams.get("loss"), reduction=self._loss_reduction),
+            self._hparams.get("loss"),
+            weights_feature_name=self._hparams.get(_LOSS_WEIGHT),
+            reduction=self._loss_reduction),
         eval_metric_fns=self._eval_metric_fns(),
         train_op_fn=_train_op_fn)
 
@@ -313,3 +377,459 @@ class EstimatorBuilder(object):
         keep_checkpoint_max=self._hparams.get("num_checkpoints"),
         save_checkpoints_secs=self._hparams.get("checkpoint_secs"))
     return tf.estimator.Estimator(model_fn=self._model_fn(), config=config)
+
+
+def _make_dnn_score_fn(hidden_units,
+                       activation_fn=tf.nn.relu,
+                       dropout=None,
+                       use_batch_norm=False,
+                       batch_norm_moment=0.999):
+  """Returns a DNN scoring fn that outputs a score per example.
+
+  Args:
+    hidden_units: (list) Iterable of number hidden units per layer for a DNN
+      model. All layers are fully connected. Ex. `[64, 32]` means first layer
+      has 64 nodes and second one has 32.
+    activation_fn: Activation function applied to each layer. If `None`, will
+      use `tf.nn.relu`.
+    dropout: (float) When not `None`, the probability we will drop out a given
+      coordinate.
+    use_batch_norm: (bool) If true, use batch normalization after each hidden
+      layer.
+    batch_norm_moment: (float) Momentum for the moving average in batch
+      normalization.
+
+  Returns:
+    A DNN scoring function.
+  """
+  activation_fn = activation_fn or tf.nn.relu
+
+  def _scoring_function(context_features, example_features, mode):
+    """Defines the DNN-based scoring fn.
+
+    Args:
+      context_features: (dict) A mapping from context feature names to dense 2-D
+        Tensors of shape [batch_size, ...].
+      example_features: (dict) A mapping from example feature names to dense 3-D
+        Tensors of shape [batch_size, list_size, ...].
+      mode: (`tf.estimator.ModeKeys`) TRAIN, EVAL, or PREDICT.
+
+    Returns:
+      A Tensor of shape [batch_size, 1] containing per-example.
+      scores.
+    """
+    # Input layer.
+    with tf.compat.v1.name_scope("input_layer"):
+      example_input = [
+          tf.compat.v1.layers.flatten(example_features[name])
+          for name in sorted(list(example_features.keys()))
+      ]
+      context_input = [
+          tf.compat.v1.layers.flatten(context_features[name])
+          for name in sorted(list(context_features.keys()))
+      ]
+      # Concat context and example features as input.
+      input_layer = tf.concat(context_input + example_input, 1)
+
+    is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+    cur_layer = input_layer
+    # Construct a deep neural network model.
+    with tf.compat.v1.name_scope("dnn_model"):
+      if use_batch_norm:
+        cur_layer = tf.compat.v1.layers.batch_normalization(
+            cur_layer, training=is_training, momentum=batch_norm_moment)
+      logits = _feed_forward_network(
+          cur_layer,
+          map(int, hidden_units),
+          output_units=1,
+          activation_fn=activation_fn,
+          batch_norm=use_batch_norm,
+          batch_norm_moment=batch_norm_moment,
+          dropout=dropout,
+          is_training=is_training)
+
+    tf.compat.v1.summary.scalar("logits_mean",
+                                tf.reduce_mean(input_tensor=logits))
+    return logits
+
+  return _scoring_function
+
+
+def make_dnn_ranking_estimator(
+    example_feature_columns,
+    hidden_units,
+    context_feature_columns=None,
+    optimizer=None,
+    learning_rate=0.05,
+    listwise_inference=False,
+    loss="approx_ndcg_loss",
+    loss_reduction=tf.compat.v1.losses.Reduction.SUM_OVER_BATCH_SIZE,
+    activation_fn=tf.nn.relu,
+    dropout=None,
+    use_batch_norm=False,
+    batch_norm_moment=0.999,
+    model_dir=None,
+    checkpoint_secs=120,
+    num_checkpoints=1000):
+  """Builds an `Estimator` instance with DNN scoring function.
+
+  Args:
+    example_feature_columns: (dict) Example (aka, document) feature columns.
+    hidden_units: (list) Iterable of number hidden units per layer for a DNN
+      model. All layers are fully connected. Ex. `[64, 32]` means first layer
+      has 64 nodes and second one has 32.
+    context_feature_columns: (dict) Context (aka, query) feature columns.
+    optimizer: (`tf.Optimizer`) An `Optimizer` object for model optimzation.
+    learning_rate: (float) Only used if `optimizer` is a string. Defaults to
+      0.05.
+    listwise_inference: (bool) Whether the inference will be performed with the
+      listwise data format such as `ExampleListWithContext`.
+    loss: (str) A string to decide the loss function used in training. See
+      `RankingLossKey` class for possible values.
+    loss_reduction: (str) An enum of strings indicating the loss reduction type.
+      See type definition in the `tf.compat.v1.losses.Reduction`.
+    activation_fn: Activation function applied to each layer. If `None`, will
+      use `tf.nn.relu`.
+    dropout: (float) When not `None`, the probability we will drop out a given
+      coordinate.
+    use_batch_norm: (bool) Whether to use batch normalization after each hidden
+      layer.
+    batch_norm_moment: (float) Momentum for the moving average in batch
+      normalization.
+    model_dir: (str) Directory to save model parameters, graph and etc. This can
+      also be used to load checkpoints from the directory into a estimator to
+      continue training a previously saved model.
+    checkpoint_secs: (int) Time interval (in seconds) to save checkpoints.
+    num_checkpoints: (int) Number of checkpoints to keep.
+
+  Returns:
+    An `Estimator` with DNN scoring function.
+  """
+
+  scoring_function = _make_dnn_score_fn(
+      hidden_units,
+      activation_fn=activation_fn,
+      dropout=dropout,
+      use_batch_norm=use_batch_norm,
+      batch_norm_moment=batch_norm_moment)
+
+  hparams = dict(
+      model_dir=model_dir,
+      learning_rate=learning_rate,
+      listwise_inference=listwise_inference,
+      loss=loss,
+      checkpoint_secs=checkpoint_secs,
+      num_checkpoints=num_checkpoints)
+
+  return EstimatorBuilder(
+      context_feature_columns,
+      example_feature_columns,
+      optimizer=optimizer,
+      scoring_function=scoring_function,
+      loss_reduction=loss_reduction,
+      hparams=hparams).make_estimator()
+
+
+def _feed_forward_network(x,
+                          hidden_layer_dims,
+                          output_units,
+                          activation_fn=tf.nn.relu,
+                          batch_norm=False,
+                          batch_norm_moment=0.999,
+                          dropout=None,
+                          is_training=None):
+  """Defines feed-forward network.
+
+  Args:
+   x: Input tensor.
+   hidden_layer_dims: Iterable of number hidden units per layer. All layers are
+     fully connected. Ex. `[64, 32]` means first layer has 64 nodes and second
+     one has 32.
+   output_units: (int) Size of output logits from this tower.
+   activation_fn: Activation function applied to each layer. If `None`, will use
+     ReLU activation.
+   batch_norm: Whether to use batch normalization after each hidden layer.
+   batch_norm_moment: Momentum for the moving average in batch normalization.
+   dropout: When not `None`, the probability we will drop out a given
+     coordinate.
+   is_training: Whether in the training mode.
+
+  Returns:
+    Output tensor.
+  """
+
+  for layer_width in map(int, hidden_layer_dims):
+    x = tf.compat.v1.layers.dense(x, units=layer_width)
+    if batch_norm:
+      x = tf.compat.v1.layers.batch_normalization(
+          x, training=is_training, momentum=batch_norm_moment)
+    x = activation_fn(x)
+    if dropout:
+      x = tf.compat.v1.layers.dropout(
+          inputs=x, rate=dropout, training=is_training)
+  output = tf.compat.v1.layers.dense(x, units=output_units)
+  return output
+
+
+def _make_gam_score_fn(context_hidden_units,
+                       example_hidden_units,
+                       activation_fn=tf.nn.relu,
+                       dropout=None,
+                       batch_norm=False,
+                       batch_norm_moment=0.999):
+  """Returns a scoring fn that outputs a score per example."""
+  activation_fn = activation_fn or tf.nn.relu
+
+  def _scoring_fn(context_features, example_features, mode):
+    """Defines the scoring fn for GAM.
+
+    Args:
+      context_features: (dict) A mapping from context feature names to dense 2-D
+        Tensors of shape [batch_size, ...].
+      example_features: (dict) A mapping from example feature names to dense 3-D
+        Tensors of shape [batch_size, list_size, ...].
+      mode: (`tf.estimator.ModeKeys`) TRAIN, EVAL, or PREDICT.
+
+    Returns:
+      A Tensor of shape [batch_size, 1] containing per-example scores.
+    """
+
+    # Input layer.
+    example_feature_names = sorted(list(example_features.keys()))
+    context_feature_names = sorted(list(context_features.keys()))
+    with tf.compat.v1.name_scope("input_layer"):
+      example_input = [(name,
+                        tf.compat.v1.layers.flatten(example_features[name]))
+                       for name in sorted(list(example_feature_names))]
+      context_input = [(name,
+                        tf.compat.v1.layers.flatten(context_features[name]))
+                       for name in sorted(list(context_feature_names))]
+
+    is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+
+    # Construct a tower for each example feature.  Each tower outputs a
+    # scalar value as the sub-score.  All sub-scores are
+    # [batch_size * list_size, 1]-shaped tensors and are stored in
+    # `sub_logits_list` as a `feature_num`-sized list.
+    with tf.compat.v1.name_scope("example_feature_towers"):
+      sub_logits_list = []
+      for name, input_layer in example_input:
+        with tf.compat.v1.name_scope("{}_tower".format(name)):
+          cur_layer = input_layer
+          if batch_norm:
+            cur_layer = tf.compat.v1.layers.batch_normalization(
+                cur_layer, training=is_training, momentum=batch_norm_moment)
+          sub_logits = _feed_forward_network(
+              cur_layer,
+              map(int, example_hidden_units),
+              output_units=1,
+              activation_fn=activation_fn,
+              batch_norm=batch_norm,
+              batch_norm_moment=batch_norm_moment,
+              dropout=dropout,
+              is_training=is_training)
+          sub_logits = tf.identity(
+              sub_logits, name="{}_{}".format(name, _SUBSCORE_POSTFIX))
+          sub_logits_list.append(sub_logits)
+
+    # Construct a tower for each context feature.  Each tower outputs a
+    # weighting vector of `feature_num`-dim where `feature_num` is the number
+    # of example features.  All the vectors are
+    # [batch_size * list_size, feature_num] tensors and are stored in
+    # `sub_weights_list` with length of number of context feature.
+    sub_weights_list = []
+    if context_input:
+      # Construct a tower per context features.
+      with tf.compat.v1.name_scope("context_feature_towers"):
+        feature_num = len(sub_logits_list)
+        for name, input_layer in context_input:
+          with tf.compat.v1.name_scope("{}_tower".format(name)):
+            cur_layer = input_layer
+            if batch_norm:
+              cur_layer = tf.compat.v1.layers.batch_normalization(
+                  cur_layer, training=is_training, momentum=batch_norm_moment)
+            sub_weights = _feed_forward_network(
+                cur_layer,
+                map(int, context_hidden_units),
+                output_units=feature_num,
+                activation_fn=activation_fn,
+                batch_norm=batch_norm,
+                batch_norm_moment=batch_norm_moment,
+                dropout=dropout,
+                is_training=is_training)
+            sub_weights = tf.math.softmax(
+                sub_weights, name="{}_{}".format(name, _SUBWEIGHT_POSTFIX))
+            sub_weights_list.append(sub_weights)
+
+    # Construct an additive model from the outputs of all example feature towers
+    # `sub_logits_list` weighted by outputs of all context feature towers
+    # `sub_weights_list`.  If no context features are provided, the outputs will
+    # simply be the sum of `sub_logits_list`.
+    if sub_weights_list:
+      sub_logits = tf.concat(sub_logits_list, axis=-1)
+      feature_weights = tf.math.add_n(sub_weights_list)
+      logits = tf.math.reduce_sum(
+          input_tensor=sub_logits * feature_weights, axis=-1)
+    else:
+      logits = tf.math.add_n(sub_logits_list)
+
+    tf.compat.v1.summary.scalar("logits_mean",
+                                tf.reduce_mean(input_tensor=logits))
+    return logits
+
+  return _scoring_fn
+
+
+# TODO: Attach the link to the paper.
+class GAMEstimatorBuilder(EstimatorBuilder):
+  """Builds a TFR estimator with subscore signatures of GAM models.
+
+  Neural Generalized Additive Ranking Model is an additive ranking model.
+  See the paper (https://arxiv.org/abs/2005.02553) for more details.
+  For each example x with n features (x_1, x_2, ..., x_n), the ranking score is:
+
+  F(x) = f1(x_1) + f2(x_2) + ... + fn(x_n)
+
+  where each feature is scored by a corresponding submodel, and the overall
+  ranking score is the sum of all the submodels' outputs. Each submodel is a
+  standalone feed-forward network.
+
+  When there are m context features (c_1, c_2, ..., c_m), the ranking score
+  will be determined by:
+
+  F(c, x) = w1(c) * f1(x_1) + w2(c) * f2(x_2) + ... + wn(c) * fn(x_n)
+
+  where (w1(c), w2(c), ..., wn(c)) is a weighting vector determined solely by
+  context features. For each context feature c_j, a feed-forward submodel is
+  constructed to derive a weighting vector (wj1(c_j), wj2(c_j), ..., wjn(c_j)).
+  The final weighting vector is the sum of the output of all the context
+  features' submodels.
+
+  The model is implicitly interpretable as the contribution of each feature to
+  the final ranking score can be easily visualized. However, the model does not
+  have higher-order inter-feature interactions and hence may not have
+  performance as good as the fully-connected DNN.
+
+  The output of each example feature's submodel can be retrieved by tensor
+  named `{feature_name}_subscore`. The output of each context feature's submodel
+  is a n-dimensional vector and can be retrieved by tensor named
+  `{feature_name}_subweight`.
+  """
+
+  def _model_fn(self):
+    """Wraps model_fn with additional signatures of subscores."""
+
+    def _gam_model_fn(features, labels, mode, params, config):
+      """Redefines the model_fn for GAM to include subscore signatures."""
+      estimator_spec = super(GAMEstimatorBuilder,
+                             self)._model_fn()(features, labels, mode, params,
+                                               config)
+      if mode == tf.estimator.ModeKeys.PREDICT:
+        # Export subscores of each feature.  Find nodes ending with
+        # `_SUBSCORE_POSTFIX` and `_SUBWEIGHT_POSTFIX` and create signatures
+        # with their corresponding tensors as outputs.  Signatures for example
+        # feature sub-scores are regression signatures, and signatures for
+        # context feature weighting vectors are prediction signatures.
+        subscore_signatures = {}
+        for node in tf.compat.v1.get_default_graph().as_graph_def().node:
+          if node.name.endswith(_SUBSCORE_POSTFIX):
+            subscore_name = node.name[node.name.rfind("/") + 1:]
+            subscore_tensor = (
+                tf.compat.v1.get_default_graph().get_tensor_by_name(
+                    "{}:0".format(node.name)))
+            subscore_signatures[subscore_name] = (
+                tf.estimator.export.RegressionOutput(subscore_tensor))
+          elif node.name.endswith(_SUBWEIGHT_POSTFIX):
+            subscore_name = node.name[node.name.rfind("/") + 1:]
+            subscore_tensor = (
+                tf.compat.v1.get_default_graph().get_tensor_by_name(
+                    "{}:0".format(node.name)))
+            subscore_signatures[subscore_name] = (
+                tf.estimator.export.PredictOutput(subscore_tensor))
+
+        estimator_spec.export_outputs.update(subscore_signatures)
+      return estimator_spec
+
+    return _gam_model_fn
+
+
+def make_gam_ranking_estimator(
+    example_feature_columns,
+    example_hidden_units,
+    context_feature_columns=None,
+    context_hidden_units=None,
+    optimizer=None,
+    learning_rate=0.05,
+    loss="approx_ndcg_loss",
+    loss_reduction=tf.compat.v1.losses.Reduction.SUM_OVER_BATCH_SIZE,
+    activation_fn=tf.nn.relu,
+    dropout=None,
+    use_batch_norm=False,
+    batch_norm_moment=0.999,
+    model_dir=None,
+    checkpoint_secs=120,
+    num_checkpoints=1000):
+  """Builds an `Estimator` instance with GAM scoring function.
+
+  See the comment of `GAMEstimatorBuilder` class for more details.
+
+  Args:
+    example_feature_columns: (dict) A dict containing all the example feature
+      columns used by the model. Keys are feature names, and values are
+      instances of classes derived from `_FeatureColumn`.
+    example_hidden_units: (list) Iterable of number hidden units per layer for
+      example features. All layers are fully connected. Ex. `[64, 32]` means
+      first layer has 64 nodes and second one has 32.
+    context_feature_columns: (dict) A dict containing all the context feature
+      columns used by the model. See `example_feature_columns`.
+    context_hidden_units: (list) Iterable of number hidden units per layer for
+      context features. See `example_hidden_units`.
+    optimizer: (`tf.Optimizer`) An `Optimizer` object for model optimzation. If
+      `None`, an Adagard optimizer with `learning_rate` will be created.
+    learning_rate: (float) Only used if `optimizer` is a string. Defaults to
+      0.05.
+    loss: (str) A string to decide the loss function used in training. See
+      `RankingLossKey` class for possible values.
+    loss_reduction: (str) An enum of strings indicating the loss reduction type.
+      See type definition in the `tf.compat.v1.losses.Reduction`.
+    activation_fn: Activation function applied to each layer. If `None`, will
+      use `tf.nn.relu`.
+    dropout: (float) When not `None`, the probability we will drop out a given
+      coordinate.
+    use_batch_norm: (bool) Whether to use batch normalization after each hidden
+      layer.
+    batch_norm_moment: (float) Momentum for the moving average in batch
+      normalization.
+    model_dir: (str) Directory to save model parameters, graph and etc. This can
+      also be used to load checkpoints from the directory into a estimator to
+      continue training a previously saved model.
+    checkpoint_secs: (int) Time interval (in seconds) to save checkpoints.
+    num_checkpoints: (int) Number of checkpoints to keep.
+
+  Returns:
+    An `Estimator` with GAM scoring function.
+  """
+
+  scoring_function = _make_gam_score_fn(
+      context_hidden_units,
+      example_hidden_units,
+      activation_fn=activation_fn,
+      dropout=dropout,
+      batch_norm=use_batch_norm,
+      batch_norm_moment=batch_norm_moment)
+
+  hparams = dict(
+      model_dir=model_dir,
+      learning_rate=learning_rate,
+      listwise_inference=False,
+      loss=loss,
+      checkpoint_secs=checkpoint_secs,
+      num_checkpoints=num_checkpoints)
+
+  return GAMEstimatorBuilder(
+      context_feature_columns,
+      example_feature_columns,
+      optimizer=optimizer,
+      scoring_function=scoring_function,
+      loss_reduction=loss_reduction,
+      hparams=hparams).make_estimator()

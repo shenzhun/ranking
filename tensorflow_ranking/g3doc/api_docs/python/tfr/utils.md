@@ -14,17 +14,15 @@
     <img src="https://www.tensorflow.org/images/GitHub-Mark-32px.png" />
     View source on GitHub
   </a>
-</td></table>
+</td>
+</table>
 
 Utility functions for ranking library.
 
 ## Functions
 
-[`approx_ranks(...)`](../tfr/utils/approx_ranks.md): Computes approximate ranks
-given a list of logits.
-
-[`inverse_max_dcg(...)`](../tfr/utils/inverse_max_dcg.md): Computes the inverse
-of max DCG.
+[`de_noise(...)`](../tfr/utils/de_noise.md): Returns a float `Tensor` as the
+de-noised `counts`.
 
 [`is_label_valid(...)`](../tfr/utils/is_label_valid.md): Returns a boolean
 `Tensor` for label validity.
@@ -41,16 +39,10 @@ first n dims of the input `tensor` to `new shape`.
 [`reshape_to_2d(...)`](../tfr/utils/reshape_to_2d.md): Converts the given
 `tensor` to a 2-D `Tensor`.
 
-[`scatter_to_2d(...)`](../tfr/utils/scatter_to_2d.md): Scatters a flattened 1-D
-`tensor` to 2-D with padding based on `segments`.
-
-[`segment_sorted_ranks(...)`](../tfr/utils/segment_sorted_ranks.md): Returns an
-int `Tensor` as the ranks after sorting scores per segment.
-
 [`shuffle_valid_indices(...)`](../tfr/utils/shuffle_valid_indices.md): Returns a
 shuffle of indices with valid ones on top.
 
-[`sort_by_scores(...)`](../tfr/utils/sort_by_scores.md): Sorts example features
+[`sort_by_scores(...)`](../tfr/utils/sort_by_scores.md): Sorts list of features
 according to per-example scores.
 
 [`sorted_ranks(...)`](../tfr/utils/sorted_ranks.md): Returns an int `Tensor` as

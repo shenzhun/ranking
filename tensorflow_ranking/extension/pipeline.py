@@ -58,6 +58,7 @@ class RankingPipeline(object):
         num_eval_steps=100,
         loss="softmax_loss",
         list_size=10,
+        listwise_inference=False,
         convert_labels_to_binary=False,
         model_dir="/path/to/your/model/directory")
 
@@ -67,7 +68,7 @@ class RankingPipeline(object):
   ranking_pipeline = tfr.ext.pipeline.RankingPipeline(
         context_feature_columns,
         example_feature_columns,
-        hparams
+        hparams,
         estimator=estimator,
         label_feature_name="relevance",
         label_feature_type=tf.int64)
@@ -112,6 +113,7 @@ class RankingPipeline(object):
   class CustomizedDatasetRankingPipeline(tfr.ext.pipeline.RankingPipeline):
     def _make_dataset(self,
                       batch_size,
+                      list_size,
                       input_pattern,
                       randomize_input=True,
                       num_epochs=None):
@@ -140,7 +142,6 @@ class RankingPipeline(object):
                dataset_reader=tf.data.TFRecordDataset,
                best_exporter_metric=None,
                best_exporter_metric_higher_better=True,
-               export_elwc=False,
                size_feature_name=None):
     """Constructor.
 
@@ -156,8 +157,6 @@ class RankingPipeline(object):
         None, exports the model with the minimal loss value.
       best_exporter_metric_higher_better: (bool) If a higher metric is better.
         This is only used if `best_exporter_metric` is not None.
-      export_elwc: (bool) Whether to export a TF-Ranking model that accepts ELWC
-        (`ExampleListWithContext`) while serving. Default to not support ELWC.
       size_feature_name: (str) If set, populates the feature dictionary with
         this name and the coresponding value is a `tf.int32` Tensor of shape
         [batch_size] indicating the actual sizes of the example lists before
@@ -176,7 +175,6 @@ class RankingPipeline(object):
     self._best_exporter_metric = best_exporter_metric
     self._best_exporter_metric_higher_better = (
         best_exporter_metric_higher_better)
-    self._export_elwc = export_elwc
     self._size_feature_name = size_feature_name
 
   def _required_hparam_keys(self):
@@ -185,7 +183,7 @@ class RankingPipeline(object):
         "train_input_pattern", "eval_input_pattern", "train_batch_size",
         "eval_batch_size", "checkpoint_secs", "num_checkpoints",
         "num_train_steps", "num_eval_steps", "loss", "list_size",
-        "convert_labels_to_binary", "model_dir"
+        "convert_labels_to_binary", "model_dir", "listwise_inference"
     ]
     return required_hparam_keys
 
@@ -205,7 +203,8 @@ class RankingPipeline(object):
     if estimator is None:
       raise ValueError("The `estimator` cannot be empty!")
 
-    if not isinstance(estimator, tf.estimator.Estimator):
+    if not isinstance(
+        estimator, (tf.estimator.Estimator, tf.compat.v1.estimator.Estimator)):
       raise ValueError(
           "The argument estimator needs to be of type tf.estimator.Estimator, "
           "not %s." % type(estimator))
@@ -225,6 +224,7 @@ class RankingPipeline(object):
 
   def _make_dataset(self,
                     batch_size,
+                    list_size,
                     input_pattern,
                     randomize_input=True,
                     num_epochs=None):
@@ -233,6 +233,7 @@ class RankingPipeline(object):
     Args:
       batch_size: (int) The number of input examples to process per batch. Use
         params['batch_size'] for TPUEstimator, and `batch_size` for Estimator.
+      list_size: (int) The list size for an ELWC example.
       input_pattern: (str) File pattern for the input data.
       randomize_input: (bool) If true, randomize input example order. It should
         almost always be true except for unittest/debug purposes.
@@ -256,7 +257,7 @@ class RankingPipeline(object):
         file_pattern=input_pattern,
         data_format=tfr_data.ELWC,
         batch_size=batch_size,
-        list_size=self._hparams.get("list_size"),
+        list_size=list_size,
         context_feature_spec=context_feature_spec,
         example_feature_spec=example_feature_spec,
         reader=self._dataset_reader,
@@ -277,6 +278,7 @@ class RankingPipeline(object):
   def _make_input_fn(self,
                      input_pattern,
                      batch_size,
+                     list_size,
                      randomize_input=True,
                      num_epochs=None):
     """Returns the input function for the ranking model.
@@ -284,6 +286,7 @@ class RankingPipeline(object):
     Args:
       input_pattern: (str) File pattern for the input data.
       batch_size: (int) The number of input examples to process per batch.
+      list_size: (int) The list size for an ELWC example.
       randomize_input: (bool) If true, randomize input example order. It should
         almost always be true except for unittest/debug purposes.
       num_epochs: (int) The number of times the input dataset must be repeated.
@@ -297,6 +300,7 @@ class RankingPipeline(object):
       """`input_fn` for the `Estimator`."""
       return self._make_dataset(
           batch_size=batch_size,
+          list_size=list_size,
           input_pattern=input_pattern,
           randomize_input=randomize_input,
           num_epochs=num_epochs)
@@ -315,7 +319,7 @@ class RankingPipeline(object):
     example_feature_spec = tf.feature_column.make_parse_example_spec(
         self._example_feature_columns.values())
 
-    if self._export_elwc:
+    if self._hparams.get("listwise_inference"):
       # Exports accept the `ExampleListWithContext` format during serving.
       return tfr_data.build_ranking_serving_input_receiver_fn(
           data_format=tfr_data.ELWC,
@@ -380,12 +384,16 @@ class RankingPipeline(object):
 
   def _train_eval_specs(self):
     """Makes a tuple of (train_spec, eval_on_eval_spec, eval_on_train_spec)."""
+    train_list_size = self._hparams.get("list_size")
+    eval_list_size = self._hparams.get("eval_list_size") or train_list_size
     train_input_fn = self._make_input_fn(
         input_pattern=self._hparams.get("train_input_pattern"),
-        batch_size=self._hparams.get("train_batch_size"))
+        batch_size=self._hparams.get("train_batch_size"),
+        list_size=train_list_size)
     eval_input_fn = self._make_input_fn(
         input_pattern=self._hparams.get("eval_input_pattern"),
-        batch_size=self._hparams.get("eval_batch_size"))
+        batch_size=self._hparams.get("eval_batch_size"),
+        list_size=eval_list_size)
 
     train_spec = tf.estimator.TrainSpec(
         input_fn=train_input_fn, max_steps=self._hparams.get("num_train_steps"))

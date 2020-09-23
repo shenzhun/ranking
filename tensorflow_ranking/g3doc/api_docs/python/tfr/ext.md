@@ -14,7 +14,8 @@
     <img src="https://www.tensorflow.org/images/GitHub-Mark-32px.png" />
     View source on GitHub
   </a>
-</td></table>
+</td>
+</table>
 
 TensorFlow Ranking library.
 
@@ -22,3 +23,6 @@ TensorFlow Ranking library.
 
 [`pipeline`](../tfr/ext/pipeline.md) module: Provides a `RankingPipeline` for
 running a TF-Ranking model.
+
+[`tfrbert`](../tfr/ext/tfrbert.md) module: Class defining utilities for
+finetuning TF-Ranking models with Bert.

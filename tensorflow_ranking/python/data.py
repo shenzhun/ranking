@@ -538,8 +538,7 @@ class _SequenceExampleParser(_RankingDataParser):
     """See `_RankingDataParser`."""
     if self._shuffle_examples:
       raise ValueError(
-          "Shuffling examples is not supported in SequenceExample format."
-      )
+          "Shuffling examples is not supported in SequenceExample format.")
 
     list_size = self._list_size
     context_feature_spec = self._context_feature_spec
@@ -630,7 +629,7 @@ class _SequenceExampleParser(_RankingDataParser):
       tensor = tf.cond(
           pred=num_frames > list_size, true_fn=truncate_fn, false_fn=pad_fn)
       # Infer static shape for Tensor. Set the 2nd dim to None and set_shape
-      # merges `static_shape` with the existing static shape of the thensor.
+      # merges `static_shape` with the existing static shape of the tensor.
       if not isinstance(tensor, tf.sparse.SparseTensor):
         static_shape = t.get_shape().as_list()
         static_shape[1] = list_size_arg
@@ -834,20 +833,21 @@ def make_parsing_fn(data_format,
     raise ValueError("Format {} is not supported.".format(data_format))
 
 
-def build_ranking_dataset_with_parsing_fn(file_pattern,
-                                          parsing_fn,
-                                          batch_size,
-                                          reader=tf.data.TFRecordDataset,
-                                          reader_args=None,
-                                          num_epochs=None,
-                                          shuffle=True,
-                                          shuffle_buffer_size=1000,
-                                          shuffle_seed=None,
-                                          prefetch_buffer_size=32,
-                                          reader_num_threads=10,
-                                          sloppy_ordering=True,
-                                          drop_final_batch=False,
-                                          num_parser_threads=None):
+def build_ranking_dataset_with_parsing_fn(
+    file_pattern,
+    parsing_fn,
+    batch_size,
+    reader=tf.data.TFRecordDataset,
+    reader_args=None,
+    num_epochs=None,
+    shuffle=True,
+    shuffle_buffer_size=10000,
+    shuffle_seed=None,
+    prefetch_buffer_size=tf.data.experimental.AUTOTUNE,
+    reader_num_threads=tf.data.experimental.AUTOTUNE,
+    sloppy_ordering=False,
+    drop_final_batch=False,
+    num_parser_threads=tf.data.experimental.AUTOTUNE):
   """Builds a ranking tf.dataset using the provided `parsing_fn`.
 
   Args:
@@ -870,9 +870,9 @@ def build_ranking_dataset_with_parsing_fn(file_pattern,
     shuffle_seed: (int) Randomization seed to use for shuffling.
     prefetch_buffer_size: (int) Number of feature batches to prefetch in order
       to improve performance. Recommended value is the number of batches
-      consumed per training step (default is 1).
+      consumed per training step. Defaults to auto-tune.
     reader_num_threads: (int) Number of threads used to read records. If greater
-      than 1, the results will be interleaved.
+      than 1, the results will be interleaved. Defaults to auto-tune.
     sloppy_ordering: (bool) If `True`, reading performance will be improved at
       the cost of non-deterministic ordering. If `False`, the order of elements
       produced is deterministic prior to shuffling (elements are still
@@ -880,23 +880,31 @@ def build_ranking_dataset_with_parsing_fn(file_pattern,
       elements after shuffling is deterministic). Defaults to `False`.
     drop_final_batch: (bool) If `True`, and the batch size does not evenly
       divide the input dataset size, the final smaller batch will be dropped.
-      Defaults to `True`. If `True`, the batch_size can be statically inferred.
+      Defaults to `False`. If `True`, the batch_size can be statically inferred.
     num_parser_threads: (int) Optional number of threads to be used with
-      dataset.map() when invoking parsing_fn.
+      dataset.map() when invoking parsing_fn. Defaults to auto-tune.
 
   Returns:
     A dataset of `dict` elements. Each `dict` maps feature keys to
     `Tensor` or `SparseTensor` objects.
   """
-  files = tf.data.Dataset.list_files(
+  dataset = tf.data.Dataset.list_files(
       file_pattern, shuffle=shuffle, seed=shuffle_seed)
 
-  reader_args = reader_args or []
-  dataset = files.apply(
-      tf.data.experimental.parallel_interleave(
-          lambda filename: reader(filename, *reader_args),
-          cycle_length=reader_num_threads,
-          sloppy=sloppy_ordering))
+  if reader_num_threads == tf.data.experimental.AUTOTUNE:
+    dataset = dataset.interleave(
+        lambda filename: reader(filename, *(reader_args or [])),
+        num_parallel_calls=reader_num_threads)
+  else:
+    # cycle_length needs to be set when reader_num_threads is not AUTOTUNE.
+    dataset = dataset.interleave(
+        lambda filename: reader(filename, *(reader_args or [])),
+        cycle_length=reader_num_threads,
+        num_parallel_calls=reader_num_threads)
+
+  options = tf.data.Options()
+  options.experimental_deterministic = not sloppy_ordering
+  dataset = dataset.with_options(options)
 
   # Extract values if tensors are stored as key-value tuples.
   if tf.compat.v1.data.get_output_types(dataset) == (tf.string, tf.string):
@@ -916,7 +924,7 @@ def build_ranking_dataset_with_parsing_fn(file_pattern,
   dataset = dataset.map(parsing_fn, num_parallel_calls=num_parser_threads)
 
   # Prefetching allows for data fetching to happen on host while model runs
-  # on the accelerator. When run on CPU, makes data fecthing asynchronous.
+  # on the accelerator. When run on CPU, makes data fetching asynchronous.
   dataset = dataset.prefetch(buffer_size=prefetch_buffer_size)
 
   return dataset
@@ -974,7 +982,7 @@ def build_ranking_serving_input_receiver_fn_with_parsing_fn(
   Args:
     parsing_fn: (function) It has a single argument parsing_fn(serialized).
       Users can customize this for their own data formats.
-    receiver_name: (string) The name for the reveiver Tensor that contains the
+    receiver_name: (string) The name for the receiver Tensor that contains the
       serialized data.
     default_batch_size: (int) Number of instances expected per batch. Leave
       unset for variable batch size (recommended).
@@ -1175,7 +1183,7 @@ def read_batched_sequence_example_dataset(file_pattern,
       elements after shuffling is deterministic). Defaults to `False`.
     drop_final_batch: (bool) If `True`, and the batch size does not evenly
       divide the input dataset size, the final smaller batch will be dropped.
-      Defaults to `True`. If `True`, the batch_size can be statically inferred.
+      Defaults to `False`. If `True`, the batch_size can be statically inferred.
 
   Returns:
     A dataset of `dict` elements. Each `dict` maps feature keys to
